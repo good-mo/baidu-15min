@@ -181,6 +181,16 @@ html, body {
   line-height: 1.5;
 }
 
+.poi-warning .ghost-btn,
+#demo-banner .ghost-btn {
+  display: inline-block;
+  margin-left: 10px;
+  padding: 4px 10px;
+  min-height: 26px;
+  font-size: 12px;
+  vertical-align: middle;
+}
+
 .legend-note {
   margin-top: 6px;
   font-size: 11px;

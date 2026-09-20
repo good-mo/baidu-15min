@@ -71,6 +71,61 @@
 
   function hideNotice() { notice.classList.add("hidden"); }
 
+  /* 示例数据演示模式：百度 POI 日配额耗尽、无真实设施数据时，
+     用内置样例填充看板（仪表盘/雷达图/柱状图/达标表），并明确标注演示。 */
+  var DEMO_CATEGORIES = [
+    { key: "medical",    name: "医疗",     color: "#ef4444", count: 4,  nearest_distance_m: 320,  walk_minutes: 4.5, threshold: 1, satisfied: true },
+    { key: "commercial", name: "商业",     color: "#f97316", count: 12, nearest_distance_m: 150,  walk_minutes: 2.1, threshold: 3, satisfied: true },
+    { key: "transport",  name: "交通",     color: "#8b5cf6", count: 6,  nearest_distance_m: 90,   walk_minutes: 1.4, threshold: 2, satisfied: true },
+    { key: "education",  name: "教育",     color: "#3b82f6", count: 3,  nearest_distance_m: 480,  walk_minutes: 6.2, threshold: 1, satisfied: true },
+    { key: "dining",     name: "餐饮",     color: "#eab308", count: 18, nearest_distance_m: 60,   walk_minutes: 1.1, threshold: 5, satisfied: true },
+    { key: "finance",    name: "金融",     color: "#22c55e", count: 2,  nearest_distance_m: 410,  walk_minutes: 5.6, threshold: 1, satisfied: true },
+    { key: "life",       name: "生活服务", color: "#06b6d4", count: 5,  nearest_distance_m: 260,  walk_minutes: 3.8, threshold: 2, satisfied: true },
+    { key: "culture",    name: "文体",     color: "#ec4899", count: 1,  nearest_distance_m: 720,  walk_minutes: 9.3, threshold: 1, satisfied: true },
+  ];
+  var demoActive = false;
+  var demoTimer = null;
+
+  function demoHealthIndex() {
+    var sum = 0, sat = 0;
+    ([
+      ["medical", .20], ["commercial", .15], ["transport", .15], ["education", .15],
+      ["dining", .10], ["finance", .10], ["life", .10], ["culture", .05]
+    ]).forEach(function (row) {
+      var c = DEMO_CATEGORIES.filter(function (x) { return x.key === row[0]; })[0];
+      if (c && c.satisfied) { sum += row[1] * 100; sat++; }
+    });
+    return { health: Math.round(sum * 10) / 10, satisfied: sat };
+  }
+
+  function enterDemoMode() {
+    demoActive = true;
+    $("demo-banner").classList.remove("hidden");
+    $("poi-warning").classList.add("hidden");
+    var h = demoHealthIndex();
+    renderCategoryTable(DEMO_CATEGORIES);
+    drawBarChart(DEMO_CATEGORIES, h.health);
+    drawRadarChart(DEMO_CATEGORIES);
+    drawGauge(h.health);
+    showNotice("已切换为示例数据演示模式（内置样例），退出后可查看真实结果。", 8);
+  }
+
+  function renderCategoryTable(categories) {
+    var tbody = $("category-table").querySelector("tbody");
+    tbody.innerHTML = "";
+    categories.forEach(function (c) {
+      var tr = document.createElement("tr");
+      var ok = c.satisfied;
+      tr.innerHTML =
+        "<td>" + c.name + "</td>" +
+        "<td>" + c.count + (c.threshold > 1 ? "（阈值" + c.threshold + "）" : "") + (ok ? "" : " <span class='pill-bad'>⚠ 匮乏项</span>") + "</td>" +
+        "<td>" + (c.nearest_distance_m != null ? fmtDist(c.nearest_distance_m) : "—") + "</td>" +
+        "<td>" + (c.walk_minutes != null ? c.walk_minutes + " 分钟" : "—") + "</td>" +
+        "<td class='" + (ok ? "pill-ok" : "pill-bad") + "'>" + (ok ? "✓ 达标" : "⚠ 未达标") + "</td>";
+      tbody.appendChild(tr);
+    });
+  }
+
   function clearOverlays() {
     if (!map) return;
     overlays.forEach(function (o) {
@@ -896,11 +951,19 @@
     // POI 配额提示：百度 302/401 超限时设施统计为空，明确告知而非显示为 0
     var pw = $("poi-warning");
     var poiWarn = meta.poi_warning || {};
-    if (!r.poi_total && (poiWarn.quota_exhausted || r.health_index === 0 && r.satisfied_count === 0)) {
-      pw.textContent = poiWarn.message || "未能获取周边设施（POI）数据，设备统计与健康指数暂不可用。请稍后重试或更换密钥。";
+    $("poi-warning-text").textContent = poiWarn.message || "未能获取周边设施（POI）数据，设备统计与健康指数暂不可用。请稍后重试或更换密钥。";
+    var demoBtn = $("enter-demo-btn");
+    demoBtn.onclick = null;
+    demoBtn.onclick = function () { enterDemoMode(); };
+    if (demoActive) {
+      pw.classList.add("hidden");
+      $("demo-banner").classList.remove("hidden");
+    } else if (!r.poi_total && (poiWarn.quota_exhausted || r.health_index === 0 && r.satisfied_count === 0)) {
       pw.classList.remove("hidden");
+      $("demo-banner").classList.add("hidden");
     } else if (r.poi_total) {
       pw.classList.add("hidden");
+      $("demo-banner").classList.add("hidden");
     }
 
     // 热力说明（报告标注：热力为网格采样 + 实际精度）
@@ -1262,6 +1325,25 @@
   $("print-btn").addEventListener("click", function () {
     if (!currentResult) { showNotice("请先生成体检报告再打印。", 4); return; }
     window.print();
+  });
+
+  /* 退出示例演示：隐藏横幅、重绘真实（或空缺）看板 */
+  $("leave-demo-btn").addEventListener("click", function () {
+    demoActive = false;
+    $("demo-banner").classList.add("hidden");
+    if (currentResult) {
+      var rr = currentResult;
+      var pw2 = rr.meta && (rr.meta.poi_warning || {});
+      if (!rr.poi_total && (pw2 && pw2.quota_exhausted || rr.health_index === 0 && rr.satisfied_count === 0)) {
+        $("poi-warning").classList.remove("hidden");
+      }
+      var h0 = rr.health_index || 0;
+      renderCategoryTable(rr.categories || []);
+      drawBarChart(rr.categories || [], h0);
+      drawRadarChart(rr.categories || []);
+      drawGauge(h0);
+    }
+    showNotice("已退出示例演示模式。设施数据仍不可用，可稍后重试或更换密钥。", 7);
   });
 
   init();
