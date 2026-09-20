@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>15分钟便民生活圈体检报告</title>
+  <title>15分钟便民生活圈体检报告 v2</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -18,7 +18,7 @@
   <header class="toolbar">
     <div class="brand">
       <span class="logo">15min</span>
-      <span class="brand-text">15分钟便民生活圈<br><small>体检报告</small></span>
+      <span class="brand-text">15分钟便民生活圈<br><small>体检报告 v2</small></span>
     </div>
     <div class="controls">
       <label>样例街道
@@ -27,7 +27,13 @@
         </select>
       </label>
       <label>中心地址 / 经纬度(lng,lat)
-        <input id="addr-input" type="text" placeholder="如：深圳市南山区粤海街道科技园 或 113.9458,22.5398" size="34">
+        <input id="addr-input" type="text" placeholder="如：深圳市南山区粤海街道科技园 或 113.9458,22.5398" size="30">
+      </label>
+      <label>时间档
+        <select id="minutes-select">
+          <option value="15">15 分钟单圈</option>
+          <option value="5,10,15">5·10·15 分钟多圈</option>
+        </select>
       </label>
       <label>射线数
         <select id="rays-select">
@@ -36,9 +42,29 @@
           <option value="48">48</option>
         </select>
       </label>
-      <button id="calc-btn">计算 15 分钟等时圈</button>
+      <button id="calc-btn">计算等时圈</button>
+      <button id="draw-obstacle-btn" class="ghost-btn">添加障碍区</button>
+      <label class="inline-check"><input type="checkbox" id="traffic-cb"> 路况</label>
     </div>
   </header>
+
+  <!-- v2 扩展区：障碍列表 + 阻抗参数 -->
+  <section class="extras">
+    <div id="obstacle-list" class="obstacle-list hidden">
+      <span class="extras-title">障碍区（模拟施工围挡）</span>
+      <span id="obstacle-items"></span>
+      <button id="clear-obstacle-btn" class="mini-btn">清空</button>
+      <span class="hint">点击地图开始绘制：每次单击加一个顶点，双击闭合</span>
+    </div>
+    <details class="params">
+      <summary>阻抗参数（估算模型）</summary>
+      <div class="params-body">
+        <label>过街等待 <input id="crossing-sec" type="number" min="0" max="300" step="5" value="30"> 秒/次</label>
+        <label>天桥/地道 <input id="overpass-sec" type="number" min="0" max="600" step="10" value="120"> 秒/次</label>
+        <label>步行速度 <input id="walk-speed" type="number" min="0.5" max="3" step="0.1" value="1.2"> m/s</label>
+      </div>
+    </details>
+  </section>
 
   <!-- 进度条 -->
   <div id="progress-wrap" class="progress-wrap hidden">
@@ -51,16 +77,20 @@
     <section class="map-wrap">
       <div id="map" class="map-canvas"></div>
       <div id="legend" class="legend hidden">
-        <div class="legend-title">设施分类</div>
+        <div class="legend-title">图例</div>
         <div class="legend-items"></div>
-        <div class="legend-note">半透明蓝色为 15 分钟步行等时圈，灰色块为设施匮乏的灰色区域</div>
+        <div class="legend-note">
+          半透明蓝色为步行等时圈（多圈时颜色越深分钟越大）；
+          灰色块为设施匮乏的灰色区域；深灰多边形为模拟障碍区。
+        </div>
       </div>
+      <div id="draw-hint" class="draw-hint hidden">绘制中：单击添加顶点，双击闭合</div>
       <div id="map-placeholder" class="map-placeholder hidden">地图加载中…</div>
     </section>
 
     <section id="panel" class="panel hidden">
       <div class="panel-head">
-        <h2>体检报告</h2>
+        <h2>体检报告 v2</h2>
         <button id="print-btn" class="print-btn">打印 / 导出报告</button>
       </div>
 
@@ -70,7 +100,7 @@
         <h3>分类达标情况</h3>
         <table id="category-table" class="cat-table">
           <thead>
-            <tr><th>类别</th><th>数量</th><th>最近距离</th><th>真实步行</th><th>达标</th></tr>
+            <tr><th>类别</th><th>数量</th><th>最近距离</th><th>真实步行(含过街估算)</th><th>达标</th></tr>
           </thead>
           <tbody></tbody>
         </table>
@@ -82,7 +112,7 @@
       </div>
 
       <div id="gray-block" class="block hidden">
-        <h3>灰色区域</h3>
+        <h3>问题清单（灰色区域自动诊疗）</h3>
         <div id="gray-list"></div>
       </div>
 
@@ -91,6 +121,8 @@
         <div id="verdict" class="verdict"></div>
         <ul id="suggestions"></ul>
       </div>
+
+      <div id="meta-note" class="meta-note hidden"></div>
     </section>
   </main>
 

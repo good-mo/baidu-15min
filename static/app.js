@@ -1,4 +1,6 @@
-/* 15分钟便民生活圈体检报告 — 前端逻辑（原生 JS + BMapGL） */
+/* 15分钟便民生活圈体检报告 v2 — 前端逻辑（原生 JS + BMapGL）
+   v1 功能（单圈/POI/灰色区域/健康指数）+ v2 功能（多时圈/阻抗系数/
+   过街模型参数/障碍绘制/路况图层/问题清单诊疗） */
 (function () {
   "use strict";
 
@@ -7,6 +9,13 @@
   var overlays = [];          // 所有动态覆盖物
   var currentResult = null;
   var pollTimer = null;
+
+  // v2 障碍区状态
+  var obstacles = [];         // [[{lng,lat},...], ...]
+  var drawing = false;
+  var tempPts = [];
+  var drawHandlers = null;
+  var trafficLayer = null;
 
   var $ = function (id) { return document.getElementById(id); };
   var banner = $("ak-banner");
@@ -75,10 +84,12 @@
       .then(function (cfg) {
         config = cfg;
         fillSamples(cfg.samples);
+        applyV2Defaults(cfg);
         $("addr-input").value = cfg.default_center.name + "（" + cfg.default_center.lng + "," + cfg.default_center.lat + "）";
         if (!cfg.ak_configured || !cfg.ak) {
           banner.classList.remove("hidden");
           $("calc-btn").disabled = true;
+          $("draw-obstacle-btn").disabled = true;
           $("map-placeholder").classList.remove("hidden");
           $("map-placeholder").textContent = "未配置百度地图密钥，无法加载地图。请在环境变量 BAIDU_MAP_AK 配置后重启服务。";
           return;
@@ -89,6 +100,13 @@
         showNotice("加载配置失败：" + err.message, 8);
         $("calc-btn").disabled = true;
       });
+  }
+
+  function applyV2Defaults(cfg) {
+    var d = cfg.v2_defaults || {};
+    if (d.crossing_sec != null) $("crossing-sec").value = d.crossing_sec;
+    if (d.overpass_sec != null) $("overpass-sec").value = d.overpass_sec;
+    if (d.walk_speed != null) $("walk-speed").value = d.walk_speed;
   }
 
   function fillSamples(samples) {
@@ -132,6 +150,9 @@
     $("legend").classList.remove("hidden");
     renderLegend();
     $("calc-btn").disabled = false;
+    $("draw-obstacle-btn").disabled = false;
+    initObstacleDrawing();
+    initTrafficToggle();
   }
 
   function renderLegend() {
@@ -146,6 +167,157 @@
       div.appendChild(dot);
       div.appendChild(document.createTextNode(c.name + "（≥" + c.threshold + "）"));
       items.appendChild(div);
+    });
+    if (config.residential_category) {
+      var div = document.createElement("div");
+      div.className = "legend-item";
+      var dot = document.createElement("span");
+      dot.className = "legend-dot";
+      dot.style.background = config.residential_category.color;
+      div.appendChild(dot);
+      div.appendChild(document.createTextNode("住宅（辅助）"));
+      items.appendChild(div);
+    }
+  }
+
+  /* v2：路况图层（视觉参考，不参与耗时计算）。
+     若当前环境图块 URL 不生效或 BMapGL 不支持，则降级隐藏开关。 */
+  function initTrafficToggle() {
+    var cb = $("traffic-cb");
+    cb.addEventListener("change", function () {
+      if (!map) return;
+      if (this.checked) {
+        try {
+          trafficLayer = new BMapGL.TileLayer({
+            getTilesUrl: function (t) {
+              return "https://maponline0.bdimg.com/tile/?qt=traffic&x=" + t.x +
+                "&y=" + t.y + "&z=" + t.z + "&v=010&t=2";
+            }
+          });
+          map.addTileLayer(trafficLayer);
+        } catch (e) {
+          console.warn("路况图层不可用：", e);
+          this.checked = false;
+          cb.parentElement.classList.add("hidden");
+        }
+      } else if (trafficLayer) {
+        try { map.removeTileLayer(trafficLayer); } catch (e) { /* 忽略 */ }
+        trafficLayer = null;
+      }
+    });
+  }
+
+  /* ---------------- 障碍区绘制（单击加点，双击闭合） ---------------- */
+
+  function initObstacleDrawing() {
+    $("draw-obstacle-btn").addEventListener("click", toggleDraw);
+    $("clear-obstacle-btn").addEventListener("click", function () {
+      obstacles = [];
+      renderObstacleList();
+      renderObstacleOverlays();
+    });
+    $("obstacle-items").addEventListener("click", function (e) {
+      var btn = e.target;
+      if (btn && btn.dataset && btn.dataset.idx !== undefined) {
+        obstacles.splice(parseInt(btn.dataset.idx, 10), 1);
+        renderObstacleList();
+        renderObstacleOverlays();
+      }
+    });
+  }
+
+  function toggleDraw() {
+    if (!map) return;
+    if (drawing) {
+      finishDraw(false);
+    } else {
+      drawing = true;
+      var btn = $("draw-obstacle-btn");
+      btn.classList.add("active");
+      btn.textContent = "完成绘制";
+      $("draw-hint").classList.remove("hidden");
+      drawHandlers = {
+        click: addDrawPoint,
+        dblclick: finishDrawByDbl
+      };
+      map.addEventListener("click", drawHandlers.click);
+      map.addEventListener("dblclick", drawHandlers.dblclick);
+    }
+  }
+
+  function addDrawPoint(e) {
+    if (!drawing) return;
+    tempPts.push({ lng: e.lnglat.lng, lat: e.lnglat.lat });
+    var m = new BMapGL.Marker(new BMapGL.Point(tempPts[tempPts.length - 1].lng, tempPts[tempPts.length - 1].lat),
+      { icon: dotIcon("#111827", 7) });
+    map.addOverlay(m);
+    overlays.push(m);
+  }
+
+  function finishDrawByDbl() {
+    // 双击会先触发两个冗余 click（同一坐标），去掉最后一个重复点
+    if (tempPts.length >= 2 && tempPts[tempPts.length - 1].lng === tempPts[tempPts.length - 2].lng &&
+      tempPts[tempPts.length - 1].lat === tempPts[tempPts.length - 2].lat) {
+      tempPts.pop();
+    }
+    finishDraw(false);
+  }
+
+  function finishDraw(save) {
+    if (drawHandlers) {
+      map.removeEventListener("click", drawHandlers.click);
+      map.removeEventListener("dblclick", drawHandlers.dblclick);
+      drawHandlers = null;
+    }
+    if (save && tempPts.length >= 3) {
+      obstacles.push(tempPts.slice());
+    } else if (save && tempPts.length < 3) {
+      showNotice("障碍区至少需要 3 个顶点。", 5);
+    }
+    tempPts = [];
+    drawing = false;
+    var btn = $("draw-obstacle-btn");
+    btn.classList.remove("active");
+    btn.textContent = "添加障碍区";
+    $("draw-hint").classList.add("hidden");
+    renderObstacleList();
+    renderObstacleOverlays();
+  }
+
+  function renderObstacleList() {
+    var wrap = $("obstacle-list");
+    var items = $("obstacle-items");
+    if (!obstacles.length) {
+      wrap.classList.add("hidden");
+      return;
+    }
+    wrap.classList.remove("hidden");
+    items.innerHTML = "";
+    obstacles.forEach(function (poly, i) {
+      var span = document.createElement("span");
+      span.className = "obstacle-chip";
+      span.innerHTML = "障碍 " + (i + 1) + "（" + poly.length + " 顶点）";
+      var del = document.createElement("button");
+      del.textContent = "×";
+      del.dataset.idx = String(i);
+      span.appendChild(del);
+      items.appendChild(span);
+    });
+  }
+
+  function renderObstacleOverlays() {
+    if (!map) return;
+    obstacles.forEach(function (poly) {
+      if (poly.length < 3) return;
+      var pts = poly.map(function (p) { return new BMapGL.Point(p.lng, p.lat); });
+      var pg = new BMapGL.Polygon(pts, {
+        strokeColor: "#1f2937",
+        strokeWeight: 1.5,
+        fillColor: "#374151",
+        fillOpacity: 0.35
+      });
+      map.addOverlay(pg);
+      overlays.push(pg);
     });
   }
 
@@ -182,13 +354,27 @@
     $("panel").classList.add("hidden");
     currentResult = null;
 
+    var minutesRaw = $("minutes-select").value || "15";
+    var minutes = minutesRaw.split(",").map(Number);
     var rays = parseInt($("rays-select").value, 10) || 36;
-    var body = JSON.stringify({ lng: lng, lat: lat, minutes: 15, rays: rays, steps: 8 });
+    var body = {
+      lng: lng,
+      lat: lat,
+      minutes: minutes.length > 1 ? minutes : minutes[0],
+      rays: rays,
+      steps: 8,
+      walk_speed: parseFloat($("walk-speed").value) || 1.2,
+      crossing_sec: parseInt($("crossing-sec").value, 10) || 0,
+      overpass_sec: parseInt($("overpass-sec").value, 10) || 0,
+      obstacles: obstacles.map(function (poly) {
+        return poly.map(function (p) { return { lng: p.lng, lat: p.lat }; });
+      })
+    };
 
     fetchJson("/api/isochrone", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: body
+      body: JSON.stringify(body)
     }).then(function (resp) {
       showProgress(resp.job_id);
     }).catch(function (err) {
@@ -231,29 +417,41 @@
 
   /* ---------------- 结果渲染 ---------------- */
 
+  function ringColor(idx) {
+    var palette = ["#bfdbfe", "#93c5fd", "#60a5fa", "#3b82f6"];
+    return palette[Math.min(idx, palette.length - 1)];
+  }
+
   function renderResult(result) {
     currentResult = result;
     if (!map) { $("panel").classList.remove("hidden"); renderReport(result); return; }
 
     clearOverlays();
     var center = result.center;
+    var rings = result.rings || [];
+    var mainRing = rings[rings.length - 1] || {};
 
-    // 等时圈退化提示
-    if (result.isochrone.degenerate) {
+    // 等时圈退化提示（主圈面积过小）
+    if (mainRing.degenerate) {
       showNotice("该点周边路网无法形成有效的 15 分钟等时圈（面积过小），请调整中心点后重试。", 12);
     }
 
-    // 等时圈多边形（半透明蓝色）
-    var pts = result.isochrone.boundary.map(function (p) { return new BMapGL.Point(p[0], p[1]); });
-    var poly = new BMapGL.Polygon(pts, {
-      strokeColor: "#2563eb",
-      strokeWeight: 2,
-      strokeOpacity: 0.9,
-      fillColor: "#3b82f6",
-      fillOpacity: 0.22
+    // 多时圈：颜色随分钟数由浅到深
+    var allPoints = [];
+    rings.forEach(function (ring, idx) {
+      var pts = ring.boundary.map(function (p) { return new BMapGL.Point(p[0], p[1]); });
+      allPoints = allPoints.concat(pts);
+      var color = ringColor(idx);
+      var poly = new BMapGL.Polygon(pts, {
+        strokeColor: color,
+        strokeWeight: 2,
+        strokeOpacity: 0.9,
+        fillColor: color,
+        fillOpacity: 0.14 + idx * 0.05
+      });
+      map.addOverlay(poly);
+      overlays.push(poly);
     });
-    map.addOverlay(poly);
-    overlays.push(poly);
 
     // 中心点红色图钉 + 标签
     var centerPt = new BMapGL.Point(center.lng, center.lat);
@@ -265,7 +463,7 @@
     // POI 圆点，按类别颜色
     var colorMap = {};
     (config.categories || []).forEach(function (c) { colorMap[c.name] = c.color; });
-    var pol = result.categories;
+    if (config.residential_category) colorMap["住宅"] = config.residential_category.color;
     var pois = result.pois || [];
     var simplified = pois.length > 1500;   // POI 过多时简化样式
     var dotSize = simplified ? 6 : 8;
@@ -291,7 +489,7 @@
       }
     });
 
-    // 灰色区域：矩形 Polygon（灰色描边 + 灰色半透明填充），点击弹窗显示缺失清单
+    // 灰色区域矩形（点击弹窗显示诊疗信息）
     (result.gray_areas || []).forEach(function (ga) {
       var b = ga.bounds;
       if (!b) return;
@@ -311,11 +509,13 @@
         return function () {
           var missing = (g.missing && g.missing.length) ? g.missing.join("、") : "多项基础服务设施";
           var win = new BMapGL.InfoWindow(
-            "<div style='font-size:12px;line-height:1.8'><b>灰色区域</b><br>" +
+            "<div style='font-size:12px;line-height:1.8'><b>灰色区域 · " + g.priority + "优先级</b><br>" +
             "地址：" + (g.address || "未知") + "<br>" +
             "面积：约 " + g.area_km2.toFixed(3) + " km²<br>" +
+            "影响规模：" + levelText(g.affected_level) + "（500m 内 " + g.affected_res_count + " 个住宅）<br>" +
+            "严重度：" + g.severity + "<br>" +
             "500 米内缺失：<span style='color:#b45309'>" + missing + "</span></div>",
-            { width: 240, title: "设施匮乏区域" }
+            { width: 250, title: "设施匮乏区域" }
           );
           map.openInfoWindow(win, new BMapGL.Point(g.centroid.lng, g.centroid.lat));
         };
@@ -324,9 +524,37 @@
       overlays.push(rect);
     });
 
-    // 视野适配所有覆盖物
-    map.setViewport(pts, { padding: 60 });
+    // 障碍多边形（meta 回传，重绘；带说明）
+    (result.meta && result.meta.obstacles || []).forEach(function (poly) {
+      if (!poly || poly.length < 3) return;
+      var pts = poly.map(function (p) { return new BMapGL.Point(p[0], p[1]); });
+      var pg = new BMapGL.Polygon(pts, {
+        strokeColor: "#111827",
+        strokeWeight: 2,
+        fillColor: "#1f2937",
+        fillOpacity: 0.45
+      });
+      pg.addEventListener("click", function () {
+        map.openInfoWindow(new BMapGL.InfoWindow(
+          "模拟施工障碍区（假设分析，非实时施工数据）", { width: 220, title: "障碍" }),
+          pointsCenter(pts));
+      });
+      map.addOverlay(pg);
+      overlays.push(pg);
+    });
+
+    if (allPoints.length) map.setViewport(allPoints, { padding: 60 });
     renderReport(result);
+  }
+
+  function levelText(level) {
+    return level === "high" ? "高" : level === "mid" ? "中" : "低";
+  }
+
+  function pointsCenter(pts) {
+    var lng = 0, lat = 0;
+    pts.forEach(function (p) { lng += p.lng; lat += p.lat; });
+    return new BMapGL.Point(lng / pts.length, lat / pts.length);
   }
 
   /* ---------------- 报告渲染 ---------------- */
@@ -334,19 +562,27 @@
   function renderReport(r) {
     $("panel").classList.remove("hidden");
 
-    // KPI 卡片
-    var iso = r.isochrone;
+    var rings = r.rings || [];
+    var mainRing = rings[rings.length - 1] || {};
+    var crossing = mainRing.crossing || {};
+    var crossWaitMin = (crossing.crossing_wait_sec || 0) + (crossing.overpass_wait_sec || 0);
+    var meta = r.meta || {};
+
     var kpiHtml =
-      kpiCard("等时圈面积", iso.area_km2.toFixed(3) + " km²") +
+      kpiCard("等时圈面积", (r.area_km2 || 0).toFixed(3) + " km²") +
       kpiCard("圈内 POI 总数", String(r.poi_total)) +
-      kpiCard("达标类别", r.satisfied_count + " / 8") +
-      kpiCard("健康指数", String(r.health_index), "health");
+      kpiCard("达标类别", r.satisfied_count + " / " + (r.categories || []).length) +
+      kpiCard("健康指数", String(r.health_index), "health") +
+      kpiCard("阻抗系数", (mainRing.impedance_coef != null ? mainRing.impedance_coef.toFixed(2) : "-"),
+        "", "路网面积 / 直线圆面积") +
+      kpiCard("过街等待估算", (crossWaitMin > 0 ? "约 " + (crossWaitMin / 60).toFixed(1) + " 分钟" : "无"),
+        "", "主圈 36 条射线过街/天桥估算之和");
     $("kpis").innerHTML = kpiHtml;
 
     // 分类达标表
     var tbody = $("category-table").querySelector("tbody");
     tbody.innerHTML = "";
-    r.categories.forEach(function (c) {
+    (r.categories || []).forEach(function (c) {
       var tr = document.createElement("tr");
       var ok = c.satisfied;
       tr.innerHTML =
@@ -359,9 +595,9 @@
     });
 
     // Canvas 条形图
-    drawBarChart(r.categories, r.health_index);
+    drawBarChart(r.categories || [], r.health_index);
 
-    // 灰色区域列表
+    // 问题清单（灰色区域自动诊疗）
     var gb = $("gray-block");
     if (r.gray_areas && r.gray_areas.length) {
       gb.classList.remove("hidden");
@@ -371,15 +607,23 @@
         var div = document.createElement("div");
         div.className = "gray-card";
         var missing = ga.missing && ga.missing.length ? ga.missing.join("、") : "多项必需设施";
+        var sugg = (ga.suggestions && ga.suggestions.length) ? ga.suggestions.join("；") : "";
         div.innerHTML =
-          "<div class='title'>区域 " + (i + 1) + " · " + (ga.address || "未知地址") + "</div>" +
-          "网格点数 " + ga.points + "，面积约 " + ga.area_km2.toFixed(3) + " km²<br>" +
-          "<span class='missing'>500 米内缺失：" + missing + "</span>";
+          "<div class='title'>区域 " + (i + 1) + " · " + (ga.address || "未知地址") +
+          " <span class='priority-badge priority-" + ga.priority + "'>" + ga.priority + "</span></div>" +
+          "<div class='meta'>" +
+          "<span>面积 约 " + ga.area_km2.toFixed(3) + " km²</span>" +
+          "<span>影响规模 <span class='sev-tag'>" + levelText(ga.affected_level) + "</span>（500m 内 " + ga.affected_res_count + " 个住宅）</span>" +
+          "<span>严重度 <span class='sev-tag sev-" + ga.severity + "'>" + ga.severity + "</span></span>" +
+          "</div>" +
+          "<div><span class='missing'>500 米内缺失：" + missing + "</span></div>" +
+          (sugg ? "<div class='sugg'>" + sugg + "</div>" : "");
         gl.appendChild(div);
       });
-      var stat = r.gray_stats;
-      $("gray-block").querySelector("h3").textContent =
-        "灰色区域（" + stat.count + " 处 · 共 " + stat.total_area_m2.toFixed(0) + " m² · 占比 " + (Math.round(stat.ratio * 10000) / 100) + "%）";
+      var stat = r.gray_stats || {};
+      gb.querySelector("h3").textContent =
+        "问题清单（灰色区域 " + stat.count + " 处 · 共 " + fmtArea(stat.total_area_m2) +
+        " · 占等时圈 " + (Math.round((stat.ratio || 0) * 10000) / 100) + "%）";
     } else {
       gb.classList.add("hidden");
     }
@@ -393,17 +637,46 @@
       li.textContent = s;
       ul.appendChild(li);
     });
+
+    // 元信息说明（诚实标注）
+    var mn = $("meta-note");
+    var notes = [];
+    if (meta.crossing_mode === "heuristic") {
+      notes.push("过街等待为估算模型：红绿灯 " + meta.crossing_sec + " 秒/次、天桥/地道 " +
+        meta.overpass_sec + " 秒/次（参数可调），非实测数据。");
+    } else {
+      notes.push("当前接口未返回路段明细，过街估算不可用（过街成本按 0 处理）。");
+    }
+    if (meta.obstacles && meta.obstacles.length) {
+      notes.push("已开启施工障碍模拟（假设分析工具，非实时施工数据）。");
+    }
+    if (meta.v2) {
+      notes.push("步行速度 " + meta.walk_speed + " m/s（直线参照圆口径）；阻抗系数 = 路网等时圈面积/直线圆面积，越小越表示路网绕行严重。");
+    }
+    if (notes.length) {
+      mn.classList.remove("hidden");
+      mn.innerHTML = notes.join("<br>");
+    } else {
+      mn.classList.add("hidden");
+    }
   }
 
-  function kpiCard(label, value, extraCls) {
+  function kpiCard(label, value, extraCls, note) {
     return "<div class='kpi " + (extraCls || "") + "'><div class='value'>" + value +
-      "</div><div class='label'>" + label + "</div></div>";
+      "</div><div class='label'>" + label + "</div>" +
+      (note ? "<div class='kpi-card-note'>" + note + "</div>" : "") + "</div>";
   }
 
   function fmtDist(m) {
     if (m == null) return "—";
     if (m >= 1000) return (m / 1000).toFixed(2) + " km";
     return Math.round(m) + " m";
+  }
+
+  function fmtArea(m2) {
+    if (m2 == null) return "0 m²";
+    if (m2 >= 1e6) return (m2 / 1e6).toFixed(2) + " km²";
+    return Math.round(m2) + " m²";
   }
 
   /* 手绘 Canvas 条形图：8 类数量柱状图，带坐标轴和数值 */
@@ -427,7 +700,6 @@
     categories.forEach(function (c) { if (c.count > maxVal) maxVal = c.count; });
     maxVal = Math.ceil(maxVal / 2) * 2;
 
-    // 坐标轴
     ctx.strokeStyle = "#cbd5e1";
     ctx.lineWidth = 1;
     ctx.beginPath();
@@ -436,7 +708,6 @@
     ctx.lineTo(padL + w, padT + h);
     ctx.stroke();
 
-    // Y 轴刻度
     ctx.fillStyle = "#64748b";
     ctx.font = "11px sans-serif";
     ctx.textAlign = "right";
@@ -460,18 +731,15 @@
       var y = padT + h - bh;
       ctx.fillStyle = c.color;
       ctx.fillRect(x, y, barW, Math.max(bh, 1));
-      // 数值
       ctx.fillStyle = "#334155";
       ctx.textAlign = "center";
       ctx.fillText(String(c.count), x + barW / 2, y - 4);
-      // 类别名
       ctx.fillStyle = "#64748b";
       var name = c.name.length > 2 ? c.name.slice(0, 2) : c.name;
       ctx.fillText(name, x + barW / 2, padT + h + 14);
       ctx.fillText(c.satisfied ? "✓" : "⚠", x + barW / 2, padT + h + 27);
     });
 
-    // 标题
     ctx.fillStyle = "#334155";
     ctx.textAlign = "left";
     ctx.font = "12px sans-serif";

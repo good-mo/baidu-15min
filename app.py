@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-15分钟便民生活圈体检报告 — Flask 后端
+15分钟便民生活圈体检报告 v2 — Flask 后端
 
-基于百度地图开放能力（地理编码 / 逆地理编码 / POI 检索 / 步行路线规划）：
-  - 真实路网计算 15 分钟步行等时圈（射线二分法）
-  - 统计圈内 8 类民生设施覆盖并输出体检报告
-  - 自动标注设施匮乏的「灰色区域」
+v1 功能（全部保留）：等时圈（射线二分法）、8 类 POI 统计、灰色区域、
+健康指数、异步任务、结果缓存、AK 未配置降级。
+
+v2 新增：
+  - 多时圈 + 路网阻抗系数（直线参照圆，impendance_coef = 路网面积/直线圆面积）
+  - 过街阻抗模型（红绿灯/天桥地道；指令解析，启发式估算，诚实标注 unavailable）
+  - 手绘施工障碍区模拟（中心到候选点直线段与障碍多边形相交判定）
+  - 灰色区域自动诊疗（住宅 POI 受影响人口 + 严重度 + 建议 + 优先级）
 
 运行方式：python app.py --port <PORT>（默认 5000，监听 0.0.0.0）
 环境变量：BAIDU_MAP_AK（必填，从 lbsyun.baidu.com 申请）
 """
 
 import argparse
-import json
 import math
 import os
 import threading
@@ -44,6 +47,14 @@ MAX_SEARCH_DIST = 2500.0   # 等时圈最大搜索距离（米）
 POI_RADIUS = 2500          # POI 检索半径（米），覆盖等时圈
 INF_TRAVEL = 24 * 3600     # 不可达时视为 24 小时
 
+# v2 阻抗/过街参数（默认值）
+DEFAULT_WALK_SPEED = 1.2       # 步行速度 m/s（仅用于直线参照圆）
+DEFAULT_CROSSING_SEC = 30      # 每次过街（红绿灯）等待估算秒数
+DEFAULT_OVERPASS_SEC = 120     # 每次天桥/地道上下行估算秒数
+MINUTES_OPTIONS = [[15], [5, 10, 15]]   # 时间档：单圈 / 多圈
+CROSSING_KEYWORDS = ["过马路", "过街", "横穿", "穿过", "路口"]
+OVERPASS_KEYWORDS = ["天桥", "地下通道", "人行天桥", "地道"]
+
 # 限流：每次百度 API 调用前休眠 0.15s（单线程顺序调用）
 API_SLEEP = 0.15
 API_TIMEOUT = 5            # 百度 API 超时（秒）
@@ -61,7 +72,10 @@ CATEGORIES = [
     {"key": "culture",    "name": "文体",     "keywords": ["公园", "体育馆", "图书馆", "健身房"], "threshold": 1, "weight": 0.05, "color": "#ec4899"},
 ]
 
-# 灰色区域检测用的 5 类「日常必需设施」：类别 key + 名称过滤关键字
+# 灰色区域辅助检索类别：住宅（不计入 8 类达标，仅用于受影响人口估计）
+RESIDENTIAL_CATEGORY = {"key": "residential", "name": "住宅", "keywords": ["小区", "住宅区", "公寓"], "color": "#6b7280"}
+
+# 灰色区域检测用的 4 类「日常必需设施」
 REQUIRED_FACILITY_RULES = [
     ("医疗",   ["药店", "医院"]),
     ("商业",   ["超市", "便利店"]),
@@ -70,9 +84,19 @@ REQUIRED_FACILITY_RULES = [
 ]
 REQUIRED_FACILITY_LABELS = ["药店/医院", "超市/便利店", "学校", "公交/地铁站"]
 
+# 灰色区域自动诊疗：缺失类别数 -> 严重度；缺失项 -> 建议文案
+GRAY_SEVERITY_BY_MISS = {0: "匮乏", 1: "匮乏", 2: "严重", 3: "极重", 4: "极重"}
+GRAY_MISS_SUGGESTION = {
+    "药店/医院": "建议增设社区药店或便民诊室",
+    "超市/便利店": "建议引入便民超市或无人便利店",
+    "学校": "建议增设托幼点或社区学堂",
+    "公交/地铁站": "建议增设微循环公交站点或共享单车驿站",
+}
+
 GRAY_GRID_STEP = 100.0    # 灰色检测网格步长（米）
 GRAY_DIST = 500.0         # 必需设施缺失距离阈值（米）
 GRAY_MIN_POINTS = 3       # 碎片簇过滤：点数 < 3 丢弃
+RES_AFFECTED_RADIUS = 500.0  # 受影响住宅统计半径（米）
 
 # ---------------------------------------------------------------------------
 # Flask 应用
@@ -195,15 +219,21 @@ def search_pois(category, center, radius=POI_RADIUS, max_pages=3):
     return pois
 
 
-def walking_duration(origin, dest):
+def walking_duration(origin, dest, crossing_sec, overpass_sec):
     """
-    步行路线规划算路网耗时（秒）。
-    结果做内存缓存（key = origin/destination 坐标取整 5 位小数）。
-    status != 0 或异常视为不可达（返回 24h）。
+    步行路线规划算路网耗时，并解析路段明细做「过街阻抗」统计。
+
+    返回 (effective_seconds, duration, crossings, overpasses, steps_available)
+      - effective_seconds = route.duration + 过街次数*crossing_sec + 天桥次数*overpass_sec
+      - steps_available：接口是否返回了可解析的路段明细（steps）
+    结果做内存缓存（key 含坐标取整 5 位小数 + 过街参数）。
+    status != 0 或异常视为不可达（返回 24h，过街无法统计）。
+    若无 steps 明细，过街成本按 0 处理（诚实标注，不伪造数字）。
     """
     key = (
         round(origin[0], 5), round(origin[1], 5),
         round(dest[0], 5), round(dest[1], 5),
+        crossing_sec, overpass_sec,
     )
     if key in _walk_cache:
         return _walk_cache[key]
@@ -212,32 +242,103 @@ def walking_duration(origin, dest):
         "destination": "%s,%s" % (dest[1], dest[0]),
     }
     duration = INF_TRAVEL
+    crossings = 0
+    overpasses = 0
+    steps_available = False
     try:
         data = baidu_get("/directionlite/v1/walking", params)
         if data and data.get("status") == 0:
             routes = (data.get("result") or {}).get("routes") or []
             if routes:
-                duration = routes[0].get("duration", INF_TRAVEL)
+                route = routes[0]
+                duration = route.get("duration", INF_TRAVEL)
+                steps = route.get("steps") or []
+                if steps:
+                    steps_available = True
+                    for s in steps:
+                        ins = str(s.get("instruction", "") or "")
+                        if any(kw in ins for kw in CROSSING_KEYWORDS):
+                            crossings += 1
+                        if any(kw in ins for kw in OVERPASS_KEYWORDS):
+                            overpasses += 1
     except Exception:
         duration = INF_TRAVEL
-    _walk_cache[key] = duration
-    return duration
+    effective = duration + crossings * crossing_sec + overpasses * overpass_sec
+    result = (effective, duration, crossings, overpasses, steps_available)
+    _walk_cache[key] = result
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 几何工具：线段/障碍多边形相交
+# ---------------------------------------------------------------------------
+def _cross(o, p, q):
+    return (p[0] - o[0]) * (q[1] - o[1]) - (p[1] - o[1]) * (q[0] - o[0])
+
+
+def _on_segment(a, b, p):
+    return (min(a[0], b[0]) <= p[0] <= max(a[0], b[0])) and (min(a[1], b[1]) <= p[1] <= max(a[1], b[1]))
+
+
+def segments_intersect(a, b, c, d):
+    """线段 ab 与 cd 是否相交（保守：端点落边也视为相交）"""
+    d1 = _cross(c, d, a)
+    d2 = _cross(c, d, b)
+    d3 = _cross(a, b, c)
+    d4 = _cross(a, b, d)
+    if ((d1 > 0 and d2 < 0) or (d1 < 0 and d2 > 0)) and ((d3 > 0 and d4 < 0) or (d3 < 0 and d4 > 0)):
+        return True
+    if d1 == 0 and _on_segment(c, d, a):
+        return True
+    if d2 == 0 and _on_segment(c, d, b):
+        return True
+    if d3 == 0 and _on_segment(a, b, c):
+        return True
+    if d4 == 0 and _on_segment(a, b, d):
+        return True
+    return False
+
+
+def segment_hits_obstacles(a, b, obstacles):
+    """线段 ab 是否与任一障碍多边形的任一边相交"""
+    if not obstacles:
+        return False
+    for poly in obstacles:
+        n = len(poly)
+        for i in range(n):
+            c = poly[i]
+            d = poly[(i + 1) % n]
+            if segments_intersect(a, b, c, d):
+                return True
+    return False
 
 
 # ---------------------------------------------------------------------------
 # 等时圈算法（核心）
 # ---------------------------------------------------------------------------
-def compute_isochrone(center, minutes, rays, steps, progress_cb=None):
+def compute_isochrone(center, minutes, rays, steps, crossing_sec, overpass_sec,
+                      obstacles=None, progress_cb=None):
     """
-    沿中心点 360° 均匀发射 rays 条射线，每条射线上用二分法
-    找「步行耗时 = minutes 分钟」的边界点，连接成多边形即为等时圈。
-    真实路网由步行 API 的 duration 体现（不走直线）。
+    沿中心点 360° 均匀发射 rays 条射线，每条射线上用二分法找「有效步行耗时 =
+    minutes 分钟」的边界点，连接成多边形即为等时圈。
+
+    有效耗时 = 路网 duration + 过街成本（v2）；若中心到候选点的直线段穿过
+    障碍多边形，则视为不可达（INF），二分自然内缩形成「凹陷」。
+
+    返回 (boundary, crossing_stats, any_steps_available)
+      - boundary: [(lng,lat), ...]
+      - crossing_stats: {crossings, overpasses}（该圈 36 条射线最终接受候选点之和）
+      - any_steps_available: 是否至少一次解析到路段明细（决定 crossing_mode）
     """
+    obstacles = obstacles or []
     max_dist = MAX_SEARCH_DIST
     lat1m = LAT_1M
     lng1m = _lng_1m(center[1])
     limit = minutes * 60.0
     boundary = []
+    total_cross = 0
+    total_over = 0
+    any_steps = False
     for i in range(rays):
         angle = 2.0 * math.pi * i / rays
         dx, dy = math.cos(angle), math.sin(angle)  # 指东、指北
@@ -245,15 +346,28 @@ def compute_isochrone(center, minutes, rays, steps, progress_cb=None):
         for _ in range(steps):                     # 8 次二分 ≈ 10 米精度
             mid = (lo + hi) / 2.0
             p = (center[0] + dx * mid * lng1m, center[1] + dy * mid * lat1m)
-            t = walking_duration(center, p)        # 秒，走 API（带缓存）
+            if segment_hits_obstacles(center, p, obstacles):
+                t = INF_TRAVEL           # 被障碍挡住：视为不可达
+            else:
+                t, _, _, _, _ = walking_duration(center, p, crossing_sec, overpass_sec)
             if t <= limit:
                 lo = mid
             else:
                 hi = mid
-        boundary.append((center[0] + dx * lo * lng1m, center[1] + dy * lo * lat1m))
+        bp = (center[0] + dx * lo * lng1m, center[1] + dy * lo * lat1m)
+        # 过街统计口径：该射线最终接受的候选点（boundary 点）的路线
+        if segment_hits_obstacles(center, bp, obstacles):
+            pass
+        else:
+            _, _, cr, ov, sa = walking_duration(center, bp, crossing_sec, overpass_sec)
+            total_cross += cr
+            total_over += ov
+            if sa:
+                any_steps = True
+        boundary.append(bp)
         if progress_cb:
             progress_cb(i + 1, rays)
-    return boundary
+    return boundary, {"crossings": total_cross, "overpasses": total_over}, any_steps
 
 
 def smooth_boundary(boundary):
@@ -293,6 +407,12 @@ def polygon_metrics(boundary, ref_lat):
     return area_m2 / 1e6, perim_m / 1000.0
 
 
+def straight_circle(minutes, walk_speed):
+    """直线参照圆：半径 = 步行速度 * 分钟 * 60（假设无路网阻碍的理想圆）"""
+    radius_m = walk_speed * minutes * 60.0
+    return radius_m / 1000.0, math.pi * (radius_m / 1000.0) ** 2  # km, km²
+
+
 def point_in_polygon(x, y, polygon):
     """点在多边形内判定（ray casting）"""
     inside = False
@@ -308,7 +428,7 @@ def point_in_polygon(x, y, polygon):
 
 
 # ---------------------------------------------------------------------------
-# 灰色区域检测
+# 灰色区域检测（v1）+ 自动诊疗（v2）
 # ---------------------------------------------------------------------------
 def bbox_of(boundary):
     lngs = [p[0] for p in boundary]
@@ -325,13 +445,39 @@ def _haversine_km(lat1, lng1, lat2, lng2):
     return 2 * radius * math.asin(math.sqrt(a))
 
 
-def detect_gray_areas(boundary, all_pois, center_lat):
+def _affected_level(n):
+    """受影响人口规模分级：high(≥10住宅) / mid(3-9) / low(<3)"""
+    if n >= 10:
+        return "high"
+    if n >= 3:
+        return "mid"
+    return "low"
+
+
+def _gray_priority(severity, affected):
+    """自动诊疗优先级：
+       极高 = 极重 或 (严重 且 影响高)
+       高   = 严重 或 (匮乏 且 影响高)
+       中   = 匮乏 且 影响中
+       低   = 其余
     """
-    灰色区域检测：
+    if severity == "极重" or (severity == "严重" and affected == "high"):
+        return "极高"
+    if severity == "严重" or (severity == "匮乏" and affected == "high"):
+        return "高"
+    if severity == "匮乏" and affected == "mid":
+        return "中"
+    return "低"
+
+
+def detect_gray_areas(boundary, all_pois, center_lat, residential_pois=None):
+    """
+    灰色区域检测（v1）+ 自动诊疗（v2）：
       - 等时圈 bbox 内按 100m 网格取多边形内网格点
-      - 每点统计 5 类必需设施最近直线距离，≥2 类 >500m 则标记灰色点
+      - 每点统计 4 类必需设施最近直线距离，≥2 类 >500m 则标记灰色点
       - 灰色点 4-邻域 BFS 连通聚类，过滤 <3 点的碎片簇
-      - 每簇输出点数/面积/质心/质心地址/缺失设施清单
+      - 每簇：面积/质心/质心地址/缺失设施清单
+        + v2 诊疗：500m 内住宅 POI 数（受影响人口）、严重度、建议、优先级
     """
     pois_by_rule = [[] for _ in REQUIRED_FACILITY_LABELS]
     for poi in all_pois:
@@ -340,8 +486,6 @@ def detect_gray_areas(boundary, all_pois, center_lat):
         for idx, (label, keywords) in enumerate(REQUIRED_FACILITY_RULES):
             if cname == label and any(kw in name for kw in keywords):
                 pois_by_rule[idx].append(poi)
-    flag = any(len(lst) == 0 for lst in pois_by_rule)
-    # 若某类必需设施完全缺失，则网格点对该类距离记极大值
 
     min_lng, min_lat, max_lng, max_lat = bbox_of(boundary)
     lat1m = LAT_1M
@@ -407,18 +551,28 @@ def detect_gray_areas(boundary, all_pois, center_lat):
         if len(members) >= GRAY_MIN_POINTS:   # 过滤碎片簇
             clusters.append(members)
 
+    residential_pois = residential_pois or []
     result = []
     for members in clusters:
         lngs = [min_lng + c * GRAY_GRID_STEP * lng1m for (r, c) in members]
         lats = [min_lat + r * GRAY_GRID_STEP * lat1m for (r, c) in members]
         clng = sum(lngs) / len(lngs)
         clat = sum(lats) / len(lats)
-        # 簇 500 米内缺失的必需设施清单：簇内任意点该类最近距离 >500m
+        # 簇 500 米内缺失的必需设施清单
         missing = []
         for idx, (label, keywords) in enumerate(REQUIRED_FACILITY_RULES):
             lst = pois_by_rule[idx]
             if any(nearest_m(lo, la, lst) > GRAY_DIST for (lo, la) in zip(lngs, lats)):
                 missing.append(REQUIRED_FACILITY_LABELS[idx])
+        # v2 自动诊疗
+        affected_res_count = sum(
+            1 for rp in residential_pois
+            if _haversine_km(clat, clng, rp["lat"], rp["lng"]) * 1000.0 <= RES_AFFECTED_RADIUS
+        )
+        affected_level = _affected_level(affected_res_count)
+        severity = GRAY_SEVERITY_BY_MISS.get(len(missing), "匮乏")
+        suggestions = [GRAY_MISS_SUGGESTION[m] for m in missing if m in GRAY_MISS_SUGGESTION]
+        priority = _gray_priority(severity, affected_level)
         addr = ""
         try:
             rv = reverse_geocode(clng, clat)
@@ -433,6 +587,11 @@ def detect_gray_areas(boundary, all_pois, center_lat):
             "centroid": {"lng": round(clng, 6), "lat": round(clat, 6)},
             "address": addr,
             "missing": missing,
+            "suggestions": suggestions,
+            "affected_res_count": affected_res_count,
+            "affected_level": affected_level,
+            "severity": severity,
+            "priority": priority,
             "bounds": {
                 "min_lng": min(lngs), "min_lat": min(lats),
                 "max_lng": max(lngs), "max_lat": max(lats),
@@ -441,39 +600,88 @@ def detect_gray_areas(boundary, all_pois, center_lat):
     return result
 
 
+def _poly_to_tuples(poly):
+    """把障碍多边形统一为 [(lng,lat), ...]（兼容 {lng,lat} dict 与 tuple/list）"""
+    out = []
+    for p in poly:
+        if isinstance(p, dict):
+            out.append((float(p.get("lng")), float(p.get("lat"))))
+        else:
+            out.append((float(p[0]), float(p[1])))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 报告生成（任务执行体）
 # ---------------------------------------------------------------------------
 def build_report(job):
     """
-    完整报告流水线：等时圈 → POI 采集 → 圈内过滤 → 分类统计 →
-    最近设施步行分钟 → 灰色区域 → 结论建议。
+    完整报告流水线（v2）：
+      多时圈（每圈：等时圈 → 平滑 → 度量 → 阻抗系数 → 过街统计）
+      → POI 采集（8 类 + 住宅辅助）→ 圈内过滤 → 分类统计与最近设施步行分钟
+      → 灰色区域自动诊疗 → 结论建议。
     任何环节出错都置 job 为 error 并返回友好 message。
     """
     center = (job["lng"], job["lat"])
-    minutes = job["minutes"]
+    minutes_list = job["minutes_list"]
     rays = job["rays"]
     steps = job["steps"]
+    walk_speed = job["walk_speed"]
+    crossing_sec = job["crossing_sec"]
+    overpass_sec = job["overpass_sec"]
+    obstacles = [_poly_to_tuples(poly) for poly in (job["obstacles"] or [])]
+    total_rays = len(minutes_list) * rays
 
-    def progress(i, total):
-        job["progress"] = int(i / total * 100)
-        job["stage"] = "正在算路 %d/%d" % (i, total)
+    def progress(ring_idx, i, total):
+        done = ring_idx * rays + i
+        job["progress"] = int(done / total_rays * 100)
+        job["stage"] = "正在算路（圈 %d/%d）射线 %d/%d" % (ring_idx + 1, len(minutes_list), i, total)
 
     try:
-        job["stage"] = "正在算路 0/%d" % rays
+        job["stage"] = "正在算路（圈 1/%d）射线 0/%d" % (len(minutes_list), rays)
         job["status"] = "running"
         job["progress"] = 0
-        boundary = compute_isochrone(center, minutes, rays, steps, progress_cb=progress)
 
-        # 轻量平滑
-        boundary = smooth_boundary(boundary)
-        area_km2, perimeter_km = polygon_metrics(boundary, center[1])
-        degenerate = area_km2 < 0.001  # 退化：基本无有效等时圈
+        # ---- 多时圈 + 阻抗系数 + 过街统计 ----
+        rings = []
+        any_steps_global = False
+        for ring_idx, minutes in enumerate(minutes_list):
+            boundary, crossing_stats, any_steps = compute_isochrone(
+                center, minutes, rays, steps,
+                crossing_sec, overpass_sec,
+                obstacles=obstacles,
+                progress_cb=lambda i, total, _ridx=ring_idx: progress(_ridx, i, total),
+            )
+            if any_steps:
+                any_steps_global = True
+            boundary = smooth_boundary(boundary)
+            area_km2, perimeter_km = polygon_metrics(boundary, center[1])
+            straight_r_km, straight_area_km2 = straight_circle(minutes, walk_speed)
+            coef = (area_km2 / straight_area_km2) if straight_area_km2 > 0 else 0.0
+            coef = min(max(coef, 0.0), 1.0)   # 钳制到 0~1（API 数据异常时防 >1）
+            rings.append({
+                "minutes": minutes,
+                "boundary": [[round(x, 6), round(y, 6)] for (x, y) in boundary],
+                "area_km2": round(area_km2, 4),
+                "perimeter_km": round(perimeter_km, 3),
+                "straight_radius_km": round(straight_r_km, 3),
+                "straight_area_km2": round(straight_area_km2, 4),
+                "impedance_coef": round(coef, 4),
+                "crossing": {
+                    "crossing_count": crossing_stats["crossings"],
+                    "crossing_wait_sec": crossing_stats["crossings"] * crossing_sec,
+                    "overpass_count": crossing_stats["overpasses"],
+                    "overpass_wait_sec": crossing_stats["overpasses"] * overpass_sec,
+                },
+                "degenerate": area_km2 < 0.001,   # 退化：无法形成有效等时圈
+            })
+            job["stage"] = "收集周边设施 POI…"
+            job["progress"] = min(100, job["progress"] + 5)
 
-        job["stage"] = "收集周边设施 POI…"
-        job["progress"] = 100
+        main_ring = max(rings, key=lambda r: r["minutes"])   # 主圈 = 分钟数最大
+        crossing_mode = "heuristic" if any_steps_global else "unavailable"
 
-        # 采集 8 类 POI（单类失败不影响其它类）
+        # ---- POI 采集：8 类 + 住宅（辅助，不计入达标） ----
         all_pois = []
         for cat in CATEGORIES:
             try:
@@ -483,11 +691,20 @@ def build_report(job):
                 all_pois.extend(pois)
             except Exception:
                 continue  # 单类 POI 检索失败不影响其它类别
+        residential_pois = []
+        try:
+            residential_pois = search_pois(RESIDENTIAL_CATEGORY, center)
+            for p in residential_pois:
+                p["category"] = "住宅"
+            all_pois.extend(residential_pois)
+        except Exception:
+            pass
 
         job["stage"] = "统计圈内设施…"
 
-        # 只在等时圈内的 POI 才算数
-        in_pois = [p for p in all_pois if point_in_polygon(p["lng"], p["lat"], boundary)]
+        # 只在最大等时圈（主圈）内的 POI 才算数
+        main_boundary = [tuple(p) for p in main_ring["boundary"]]
+        in_pois = [p for p in all_pois if point_in_polygon(p["lng"], p["lat"], main_boundary)]
 
         def nearest_poi(lng, lat, lst):
             best, best_d = None, float("inf")
@@ -503,9 +720,10 @@ def build_report(job):
             nearest, nearest_d = nearest_poi(center[0], center[1], lst)
             walk_minutes = None
             if nearest:
-                # 对每类最近设施调用一次步行 API 得到真实步行分钟
-                dur = walking_duration(center, (nearest["lng"], nearest["lat"]))
-                walk_minutes = round(dur / 60.0, 1) if dur < INF_TRAVEL else None
+                # 对每类最近设施调用一次步行 API，用 effective_duration 换算真实步行分钟（v2 含过街）
+                eff, _, _, _, _ = walking_duration(center, (nearest["lng"], nearest["lat"]),
+                                                   crossing_sec, overpass_sec)
+                walk_minutes = round(eff / 60.0, 1) if eff < INF_TRAVEL else None
             categories_report.append({
                 "key": cat["key"],
                 "name": cat["name"],
@@ -526,41 +744,58 @@ def build_report(job):
                 satisfied_count += 1
         health_index = round(health_index, 1)
 
-        # 灰色区域检测
+        # ---- 灰色区域自动诊疗 ----
         job["stage"] = "检测灰色区域…"
-        gray_areas = detect_gray_areas(boundary, all_pois, center[1])
+        gray_areas = detect_gray_areas(main_boundary, all_pois, center[1], residential_pois)
         gray_count = len(gray_areas)
         gray_total_m2 = sum(ga["area_m2"] for ga in gray_areas)
-        gray_ratio = round(gray_total_m2 / (area_km2 * 1e6), 4) if area_km2 > 0 else 0
+        gray_ratio = round(gray_total_m2 / (main_ring["area_km2"] * 1e6), 4) if main_ring["area_km2"] > 0 else 0
 
-        # 结论建议
+        # ---- 结论建议（灰色区域按优先级排序在前） ----
         suggestions, verdict = build_suggestions(categories_report, gray_areas, health_index)
 
-        job["result"] = {
+        result = {
             "center": {"lng": center[0], "lat": center[1]},
-            "minutes": minutes,
+            "minutes": job["minutes_raw"],
+            "minutes_list": minutes_list,
             "rays": rays,
             "steps": steps,
-            "isochrone": {
-                "boundary": [[round(x, 6), round(y, 6)] for (x, y) in boundary],
-                "area_km2": round(area_km2, 4),
-                "perimeter_km": round(perimeter_km, 3),
-                "degenerate": degenerate,
-            },
+            # v2 多时圈
+            "rings": rings,
+            # v1 兼容字段：主圈
+            "area_km2": main_ring["area_km2"],
+            "perimeter_km": main_ring["perimeter_km"],
+            "isochrone": main_ring,
+            # POI
             "poi_total": len(in_pois),
+            "residential_count": len([p for p in in_pois if p["category"] == "住宅"]),
             "pois": in_pois,
+            # 分类
             "categories": categories_report,
             "health_index": health_index,
             "satisfied_count": satisfied_count,
+            # 灰色区域（v1 字段兼容 + v2 诊疗字段）
             "gray_areas": gray_areas,
-            "gray_stats": {
+            "gray": {"regions": gray_areas, "stats": {
                 "count": gray_count,
                 "total_area_m2": gray_total_m2,
                 "ratio": gray_ratio,
-            },
+            }},
+            "gray_stats": {"count": gray_count, "total_area_m2": gray_total_m2, "ratio": gray_ratio},
+            # 结论
             "suggestions": suggestions,
             "verdict": verdict,
+            # v2 元信息（诚实标注估算）
+            "meta": {
+                "v2": True,
+                "walk_speed": walk_speed,
+                "crossing_sec": crossing_sec,
+                "overpass_sec": overpass_sec,
+                "obstacles": [[list(p) for p in poly] for poly in obstacles],
+                "crossing_mode": crossing_mode,
+            },
         }
+        job["result"] = result
         job["status"] = "done"
         job["progress"] = 100
         job["stage"] = "完成"
@@ -570,10 +805,10 @@ def build_report(job):
 
 
 def build_suggestions(categories_report, gray_areas, health_index):
-    """规则生成 2-4 条中文建议 + 一句话总评"""
+    """规则生成中文建议（灰色区域按优先级排序在前，最多 6 条）+ 一句话总评"""
     suggestions = []
     template = {
-        "医疗": "该区域存在至少一个社区医疗点（药店/诊所/医院）缺口，建议增设社区医疗或诊所以便应急。",
+        "医疗": "该区域存在社区医疗点（药店/诊所/医院）缺口，建议增设社区医疗或诊所以便应急。",
         "商业": "该区域日常购物设施不足，建议增设便利店或社区超市。",
         "交通": "该区域公共交通覆盖偏弱，建议优化公交线路或增设站点。",
         "教育": "该区域教育配套不足，建议补充普惠性幼儿园或学校。",
@@ -582,16 +817,18 @@ def build_suggestions(categories_report, gray_areas, health_index):
         "生活服务": "该区域生活服务（快递/理发/洗衣）配套不足，建议引入便民服务站。",
         "文体": "该区域文体休闲设施欠缺，建议增设口袋公园或健身场地。",
     }
+    order = {"极高": 0, "高": 1, "中": 2, "低": 3}
+    sorted_gray = sorted(gray_areas, key=lambda g: order.get(g.get("priority"), 9))
+    for ga in sorted_gray[:3]:
+        loc = ga.get("address") or "等时圈内"
+        for sg in ga.get("suggestions") or []:
+            suggestions.append("（%s · %s）%s" % (ga.get("priority", "低"), loc, sg))
     for rep in categories_report:
         if not rep["satisfied"]:
             suggestions.append(template.get(rep["name"], rep["name"] + "设施不足。"))
-    for ga in gray_areas[:2]:
-        missing = "、".join(ga["missing"]) if ga["missing"] else "多项基础服务设施"
-        loc = ga["address"] or "等时圈内"
-        suggestions.append("灰色区域「%s」500 米内缺失 %s，建议重点补充相关设施。" % (loc, missing))
     if len(suggestions) < 2:
         suggestions.append("建议持续跟踪等时圈内 POI 数据变化，定期评估便民设施覆盖情况。")
-    suggestions = suggestions[:4]
+    suggestions = suggestions[:6]
 
     if health_index >= 70:
         verdict = "整体宜居便利，15 分钟生活圈内绝大多数民生需求可步行满足。"
@@ -625,6 +862,14 @@ def api_config():
         "minutes": DEFAULT_MINUTES,
         "rays": DEFAULT_RAYS,
         "categories": CATEGORIES,
+        "residential_category": RESIDENTIAL_CATEGORY,
+        "required_facility_labels": REQUIRED_FACILITY_LABELS,
+        "v2_defaults": {
+            "minutes_options": MINUTES_OPTIONS,
+            "walk_speed": DEFAULT_WALK_SPEED,
+            "crossing_sec": DEFAULT_CROSSING_SEC,
+            "overpass_sec": DEFAULT_OVERPASS_SEC,
+        },
     })
 
 
@@ -658,12 +903,31 @@ def api_reverse():
     return jsonify(result)
 
 
+def _norm_obstacles(obstacles):
+    """规范化障碍多边形：[[{lng,lat},...],...] -> [[(lng,lat),...],...]；非法返回 None"""
+    if not obstacles:
+        return []
+    out = []
+    try:
+        for poly in obstacles:
+            pts = []
+            for p in poly:
+                pts.append((float(p.get("lng")), float(p.get("lat"))))
+            if len(pts) >= 3:
+                out.append(pts)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return out
+
+
 @app.route("/api/isochrone", methods=["POST"])
 def api_isochrone():
     """
     创建异步等时圈计算任务，立即返回 {job_id}。
-    参数：{lng, lat, minutes=15, rays=36, steps=8}
-    后端内存任务表：daemon 线程执行，任务完成后结果缓存（key 含 lng/lat/minutes/rays）。
+    参数：{lng, lat, minutes(数字或数组), rays=36, steps=8,
+           walk_speed=1.2, crossing_sec=30, overpass_sec=120, obstacles=[...]}
+    后端内存任务表：daemon 线程执行，任务完成后结果缓存
+    （key 含 lng/lat/minutes/rays/steps/walk_speed/crossing_sec/overpass_sec/obstacles）。
     """
     body = request.get_json(silent=True) or {}
     try:
@@ -671,17 +935,46 @@ def api_isochrone():
         lat = float(body.get("lat"))
     except (TypeError, ValueError):
         return jsonify({"error": "缺少合法的 lng/lat 参数"}), 400
-    minutes = int(body.get("minutes", DEFAULT_MINUTES) or DEFAULT_MINUTES)
+    # minutes 兼容数字或数组
+    minutes_raw = body.get("minutes", DEFAULT_MINUTES)
+    if isinstance(minutes_raw, (list, tuple)):
+        try:
+            minutes_list = [int(m) for m in minutes_raw]
+        except (TypeError, ValueError):
+            return jsonify({"error": "minutes 数组需为数字列表"}), 400
+    else:
+        try:
+            minutes_list = [int(minutes_raw)]
+        except (TypeError, ValueError):
+            return jsonify({"error": "minutes 需为数字或数字数组"}), 400
+    if not minutes_list or not all(0 < m <= 60 for m in minutes_list):
+        return jsonify({"error": "minutes 需在 1-60 之间"}), 400
+    minutes_list = sorted(set(minutes_list))   # 去重排序，保证 rings 顺序
     rays = int(body.get("rays", DEFAULT_RAYS) or DEFAULT_RAYS)
     steps = int(body.get("steps", DEFAULT_STEPS) or DEFAULT_STEPS)
-    if not (0 < minutes <= 60):
-        return jsonify({"error": "minutes 需在 1-60 之间"}), 400
     if rays not in (24, 36, 48):
         return jsonify({"error": "rays 仅支持 24/36/48"}), 400
     if not (1 <= steps <= 16):
         return jsonify({"error": "steps 需在 1-16 之间"}), 400
+    try:
+        walk_speed = float(body.get("walk_speed", DEFAULT_WALK_SPEED))
+        crossing_sec = int(body.get("crossing_sec", DEFAULT_CROSSING_SEC))
+        overpass_sec = int(body.get("overpass_sec", DEFAULT_OVERPASS_SEC))
+    except (TypeError, ValueError):
+        return jsonify({"error": "walk_speed/crossing_sec/overpass_sec 参数非法"}), 400
+    if not (0.5 <= walk_speed <= 3.0):
+        return jsonify({"error": "walk_speed 需在 0.5-3.0 m/s 之间"}), 400
+    if crossing_sec < 0 or overpass_sec < 0:
+        return jsonify({"error": "crossing_sec/overpass_sec 不能为负"}), 400
+    obstacles = _norm_obstacles(body.get("obstacles"))
+    if obstacles is None:
+        return jsonify({"error": "obstacles 参数格式非法（应为若干 {lng,lat} 多边形）"}), 400
 
-    cache_key = (round(lng, 6), round(lat, 6), minutes, rays)
+    cache_key = (
+        round(lng, 6), round(lat, 6), tuple(minutes_list), rays, steps,
+        walk_speed, crossing_sec, overpass_sec,
+        tuple(tuple(poly) for poly in obstacles),
+    )
     with _jobs_lock:
         cached_job_id = _results_cache.get(cache_key)
         if cached_job_id and cached_job_id in _jobs:
@@ -694,9 +987,14 @@ def api_isochrone():
             "id": job_id,
             "lng": lng,
             "lat": lat,
-            "minutes": minutes,
+            "minutes_raw": minutes_raw,
+            "minutes_list": minutes_list,
             "rays": rays,
             "steps": steps,
+            "walk_speed": walk_speed,
+            "crossing_sec": crossing_sec,
+            "overpass_sec": overpass_sec,
+            "obstacles": obstacles,
             "status": "queued",
             "progress": 0,
             "stage": "排队中…",
@@ -760,10 +1058,10 @@ def api_report(job_id):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="15分钟便民生活圈体检报告")
+    parser = argparse.ArgumentParser(description="15分钟便民生活圈体检报告 v2")
     parser.add_argument("--port", type=int, default=5000, help="监听端口（默认 5000）")
     args = parser.parse_args()
-    print("15分钟便民生活圈服务启动，监听 0.0.0.0:%d，ak_configured=%s" % (args.port, bool(BAIDU_AK)))
+    print("15分钟便民生活圈服务 v2 启动，监听 0.0.0.0:%d，ak_configured=%s" % (args.port, bool(BAIDU_AK)))
     app.run(host="0.0.0.0", port=args.port, debug=False, threaded=True)
 
 
