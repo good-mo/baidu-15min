@@ -287,7 +287,8 @@
     // 单击地图即设中心（障碍绘制/取点设中心进行中时自动让位）
     map.addEventListener("click", function (e) {
       if (drawing || pickingCenter) return;
-      setCenterFromMap(e.lnglat.lng, e.lnglat.lat);
+      var pt = evtPoint(e);
+      if (pt) setCenterFromMap(pt.lng, pt.lat);
     });
     initObstacleDrawing();
     initTrafficToggle();
@@ -402,7 +403,9 @@
 
   function addDrawPoint(e) {
     if (!drawing) return;
-    tempPts.push({ lng: e.lnglat.lng, lat: e.lnglat.lat });
+    var pt = evtPoint(e);
+    if (!pt) return;
+    tempPts.push({ lng: pt.lng, lat: pt.lat });
     var m = new BMapGL.Marker(new BMapGL.Point(tempPts[tempPts.length - 1].lng, tempPts[tempPts.length - 1].lat),
       { icon: dotIcon("#111827", 7) });
     map.addOverlay(m);
@@ -514,9 +517,18 @@
     showNotice("已设置计算中心点：" + lng.toFixed(6) + "," + lat.toFixed(6) + "，点击「计算等时圈」开始分析。", 6);
   }
 
+  /* 事件对象容错取经纬度：兼容 BMapGL(e.latlng) / BMap 3.0(e.lnglat) / 传统 BMap(e.point) */
+  function evtPoint(e) {
+    if (!e) return null;
+    var p = e.latlng || e.lnglat || e.point;
+    return (p && typeof p.lng === "number" && typeof p.lat === "number") ? p : null;
+  }
+
   function onPickMapClick(e) {
     if (!pickingCenter) return;
-    var lng = e.lnglat.lng, lat = e.lnglat.lat;
+    var pt = evtPoint(e);
+    if (!pt) return;
+    var lng = pt.lng, lat = pt.lat;
     if (pickMarker) pickMarker.setPosition(new BMapGL.Point(lng, lat));
     setCenterFromMap(lng, lat);
   }
