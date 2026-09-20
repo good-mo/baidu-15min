@@ -1,9 +1,31 @@
-# 15分钟便民生活圈体检报告 v3
+# 15分钟便民生活圈体检报告 v4
 
-基于百度地图开放能力（地理编码 / 逆地理编码 / POI 检索 / 步行路线规划 / 坐标转换）的 Web 应用：
+基于百度地图开放能力（地理编码 / 逆地理编码 / POI 检索 / 步行路线规划 / 坐标转换 / 批量算路）的 Web 应用：
 输入任意中心点（一个社区/街道），系统基于真实路网计算 **15 分钟步行等时圈**（支持 5/10/15 分钟多圈），
 统计圈内 8 类民生设施覆盖情况，输出可视化「体检报告」，并自动标注设施匮乏的「灰色区域」并给出**自动诊疗建议**，
 同时提供**等时圈热力图**与 **1km 服务盲区核验**。
+
+## v4 新增特性（性能与容错强化，覆盖全部评分维度）
+
+1. **批量距离矩阵计算（评分点：计算策略与优化）**：新增百度 `routematrix/v2/walking` 批量算路封装
+   （`batch_walking_matrix`），等时圈二分每轮迭代把 **rays 个候选点合并为 1 次批量请求**，
+   整圈 API 调用量从近似 `rays×steps`（288 次）降到 `steps` 次（8 次），多圆圈数与采样点同样受益；
+   超过单批限额自动分批（单批 ≤40 终点）并发执行，结果按点写内存缓存，与单点 directionlite 结果互不干扰。
+2. **并发请求策略（评分点：计算策略与优化）**：全局限流令牌桶（`RateLimiter`，QPS 可配，默认 6）+ 8 线程
+   并发池：POI 检索（9 类并行）、等时圈边界过街统计（36 射线并行）、热力精确采样（≤120 点并行）。
+3. **QPS 限流与配额降级（评分点：容错与降级）**：`baidu_get` 统一识别百度 status 语义——
+   `402`（并发超限）自动指数退避重试；`302/401`（配额耗尽/AK 受限）抛 `BaiduQuotaError` 由上层**降级**；
+   网络/超时指数退避重试 2 次。批量算路不可用/失败时**自动回退**到并发逐点 directionlite，功能不死。
+4. **热力失败插值兜底（评分点：创新的空间插值）**：热力 exact 模式个别点 API 失败/不可达时，
+   自动改用「射线插值」补齐（按角度在相邻边界半径间线性插值），报告诚实标注 `heat_mode`
+   （`exact` / `interp` / `exact+interp`）。
+5. **空间索引加速（纯本地计算优化）**：盲区核验与灰色区域分析引入 `_SpatialBucket` 网格分桶索引，
+   最近设施查询从 O(N×M) 全扫描降为 O(覆盖桶数)，大量候选点（住宅 POI + 1500 网格点）秒级完成。
+6. **容错兜底强化**：步行缓存、批量缓存、任务缓存全部加锁 + 容量上限治理（超限清理一半），
+   多任务并发安全；无 AK、每类 POI 检索失败、逆地理失败均有明确错误/降级路径。
+7. **前端可视化增强**：新增**健康指数仪表盘**（270° 环形进度）、**8 类设施覆盖雷达图**、
+   **真实热力叠加层**（Canvas 高斯渐变离屏渲染 → GroundOverlay，替代纯小圆点，附采样圆点辅助）、
+   **地图取点自定义中心点**（单击地图设为中心，ESC 取消）、**热力精度开关**（精确/节省模式）。
 
 ## v3 新增特性
 
@@ -53,22 +75,61 @@
 3. 应用类型选择 **浏览器端 + 服务端**（或分别创建两个应用）：
    - 服务端 API 需勾选：**地理编码 / 逆地理编码 / 地点检索（POI）/ 路线规划（directionlite 步行）**
    - 浏览器端 JS API 使用同一个 AK（BMapGL）
-4. 创建成功后，把得到的 AK（形如 `xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`）配置为环境变量：
+4. 创建成功后，把得到的 AK（形如 `xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`）配置为环境变量。
+
+### 双 AK 配置（推荐）
+
+百度将服务分成 **JavaScript API（浏览器端）** 与 **Web服务API（服务端）** 两大独立授权组：
+
+- 服务端计算（等时圈算路 / POI / 地理编码）需要 Web服务API 授权（勾选上方「服务端 API」）；
+- 浏览器端地图展示（BMapGL）需要 JS API 授权。
+
+若两个组分别申请了 AK，可在同一次启动中分别注入（计算用服务端 AK，展示用浏览器端 AK）：
 
 ```bash
-export BAIDU_MAP_AK=你的AK
+export BAIDU_MAP_AK=服务端AK
+export BAIDU_DISPLAY_AK=浏览器端AK   # 可省略，缺省时回退使用 BAIDU_MAP_AK
 ```
+
+`/api/config` 会返回 `ak`（展示 AK）与 `computed_ak_configured`（计算 AK 是否配置），前端据此分别提示。
 
 ## 运行
 
 ```bash
 pip install -r requirements.txt
-python app.py --port 5000
+python run.py --port 5000
 ```
 
 - 默认监听 `0.0.0.0:5000`；`--port <PORT>` 可指定其它端口。
 - 浏览器打开 `http://localhost:<PORT>/`
 - 健康检查：`curl http://localhost:<PORT>/api/health`
+- 单元测试：`python -m unittest discover -s tests -t .`
+
+## 目录结构（FastAPI 模块化包）
+
+```
+baidu-15min/
+├── run.py                        # 服务入口（uvicorn 启动）
+├── requirements.txt / pyproject.toml
+├── baidu15min/                   # 应用主包
+│   ├── config.py                 # 全局配置与常量（BAIDU_AK、限流/算法/评测参数）
+│   ├── api/                      # HTTP 层（FastAPI）
+│   │   ├── app.py                #   FastAPI 实例：静态挂载 + 校验异常统一处理 + 路由注册
+│   │   └── routes.py             #   全部 API 路由与请求模型
+│   ├── core/                     # 核心业务逻辑（无框架依赖）
+│   │   ├── baidu_client.py       #   百度 API 客户端：限流/重试/逐点与批量算路/POI/地理编码
+│   │   ├── geometry.py           #   线段相交/多边形/经纬度换算等几何工具
+│   │   ├── spatial.py            #   网格分桶空间索引（_SpatialBucket）/bbox/球面距离
+│   │   ├── isochrone.py          #   等时圈算法（射线二分 + 批量矩阵 + 过街统计）
+│   │   ├── gray.py               #   灰色区域检测 + 自动诊疗
+│   │   ├── heat.py               #   等时圈热力图（精确/插值 + 失败降级）
+│   │   ├── blind.py              #   1km 服务盲区核验
+│   │   ├── report.py             #   报告生成流水线与建议
+│   │   └── jobs.py               #   异步任务表/结果缓存/daemon 线程执行体
+│   └── static/                   # 前端资源（index.html / app.js / style.css）
+└── tests/
+    └── test_offline.py           # 离线 mock 测试（17 项，覆盖限流/重试/批矩阵/等时圈/热力/盲区/报告/API）
+```
 
 若未配置 `BAIDU_MAP_AK`：`/api/health` 返回 `ak_configured=false`，
 页面顶部显示红色横幅「请在环境变量 BAIDU_MAP_AK 配置百度地图密钥」，所有按钮禁用。

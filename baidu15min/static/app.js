@@ -10,6 +10,37 @@
   var overlays = [];          // 所有动态覆盖物
   var currentResult = null;
   var pollTimer = null;
+  var failedResources = [];   // 页面级资源加载失败诊断（脚本/CSS 等）
+
+  // 捕获资源加载失败（SCRIPT/LINK 404、证书、拦截等），用于精确定位百度 SDK 问题
+  window.addEventListener("error", function (e) {
+    var tgt = e.target;
+    if (tgt && (tgt.tagName === "SCRIPT" || tgt.tagName === "LINK" || tgt.tagName === "IMG")) {
+      failedResources.push(tgt.src || tgt.href || tgt.currentSrc || "(inline)");
+    }
+  }, true);
+
+  /* 收集加载失败的资源清单：优先刚才捕获的，再交叉核对 performance 条目中
+     的 map.baidu.com 且非 2xx 请求（浏览器不支持 responseStatus 时按 0 处理）。 */
+  function diagFailedResources() {
+    var out = [];
+    failedResources.forEach(function (u) {
+      if (out.indexOf(u) < 0) out.push(u);
+    });
+    if (window.performance && performance.getEntriesByType) {
+      performance.getEntriesByType("resource").forEach(function (r) {
+        if (/map\.baidu\.com/.test(r.name)) {
+          var st = r.responseStatus;
+          if (st == null) st = r.transferSize === 0 && r.decodedBodySize === 0 ? "no-response" : "";
+          var key = r.name + (st ? " [" + st + "]" : "");
+          if ((st === "no-response" || (typeof st === "number" && (st < 200 || st >= 300))) && out.indexOf(key) < 0) {
+            out.push(key);
+          }
+        }
+      });
+    }
+    return out;
+  }
 
   // v3 坐标系状态（默认 BD-09，样例街道固定 BD-09 不转换）
   var coordSys = "bd09ll";
@@ -21,6 +52,10 @@
   var tempPts = [];
   var drawHandlers = null;
   var trafficLayer = null;
+  // v4 取点设中心状态
+  var pickingCenter = false;
+  var pickMarker = null;
+  var heatLayer = null;
 
   var $ = function (id) { return document.getElementById(id); };
   var banner = $("ak-banner");
@@ -114,7 +149,7 @@
           $("map-placeholder").textContent = "未配置百度地图密钥，无法加载地图。请在环境变量 BAIDU_MAP_AK 配置后重启服务。";
           return;
         }
-        loadBaiduScript(cfg.ak);
+        startMap();
       })
       .catch(function (err) {
         showNotice("加载配置失败：" + err.message, 8);
@@ -139,17 +174,39 @@
     });
   }
 
-  function loadBaiduScript(ak) {
-    var imgPlaceholder = $("map-placeholder");
-    imgPlaceholder.classList.remove("hidden");
-    var s = document.createElement("script");
-    s.src = "https://api.map.baidu.com/api?v=1.0&type=webgl&ak=" + ak;
-    s.onload = function () { setTimeout(initMap, 50); };
-    s.onerror = function () {
-      imgPlaceholder.textContent = "百度地图脚本加载失败，请检查网络或 AK 有效性。";
-      showNotice("百度地图脚本加载失败，请检查 AK 是否有效。", 10);
-    };
-    document.head.appendChild(s);
+  /* 百度 SDK 已由 index.html 头部同步注入（AK 由后端渲染）。这里做就绪检测与失败提示。 */
+  function startMap() {
+    var ph = $("map-placeholder");
+    ph.classList.remove("hidden");
+    if (window.BMapGL) {
+      ph.classList.add("hidden");
+      initMap();
+      return;
+    }
+    var tries = 0;
+    var timer = setInterval(function () {
+      if (window.__BAIDU_SDK_FAILED__) {
+        clearInterval(timer);
+        var diagF = diagFailedResources();
+        var diagTxt = diagF.length ? " 具体失败资源：\n" + diagF.join("\n") : "";
+        ph.textContent = "百度地图脚本加载失败，请检查 AK 是否有效。" + diagTxt;
+        showNotice("百度地图脚本加载失败：请确认该 AK 已添加当前域名的 referer 白名单（开放平台-应用管理），且已开通「地图GL JS版」服务。" + diagTxt, 15);
+        return;
+      }
+      if (window.BMapGL) {
+        clearInterval(timer);
+        ph.classList.add("hidden");
+        initMap();
+        return;
+      }
+      if (++tries > 60) {   // 12s 超时兜底
+        clearInterval(timer);
+        var diagT = diagFailedResources();
+        var diagStr = diagT.length ? " 具体失败资源：\n" + diagT.join("\n") : "";
+        ph.textContent = "地图组件初始化失败：请确认 AK 为浏览器端类型、已开通地图 GL JS 服务，且当前域已加入 referer 白名单（控制台可暂填 * 放行）。" + diagStr;
+        showNotice("地图初始化失败：百度 SDK 已返回但 BMapGL 未就绪，最常见原因为 referer 白名单未放行或 GL 服务未开通。" + diagStr, 15);
+      }
+    }, 200);
   }
 
   /* ---------------- 地图 ---------------- */
@@ -171,8 +228,15 @@
     renderLegend();
     $("calc-btn").disabled = false;
     $("draw-obstacle-btn").disabled = false;
+    $("pick-center-btn").disabled = false;
+    // 单击地图即设中心（障碍绘制/取点设中心进行中时自动让位）
+    map.addEventListener("click", function (e) {
+      if (drawing || pickingCenter) return;
+      setCenterFromMap(e.lnglat.lng, e.lnglat.lat);
+    });
     initObstacleDrawing();
     initTrafficToggle();
+    initPickCenter();
   }
 
   function renderLegend() {
@@ -263,6 +327,7 @@
 
   function toggleDraw() {
     if (!map) return;
+    if (pickingCenter) exitPickCenter();   // 互斥：先退出取点模式
     if (drawing) {
       finishDraw(false);
     } else {
@@ -356,6 +421,68 @@
     });
   }
 
+  /* ---------------- v4：地图取点自定义中心点 ---------------- */
+
+  function initPickCenter() {
+    $("pick-center-btn").addEventListener("click", function () {
+      if (pickingCenter) { exitPickCenter(); return; }
+      if (drawing) finishDraw(false);          // 互斥：先结束障碍绘制
+      pickingCenter = true;
+      this.classList.add("active");
+      this.textContent = "点地图选点（ESC 取消）";
+      $("draw-hint").textContent = "取点模式：单击地图任意位置设为计算中心点";
+      $("draw-hint").classList.remove("hidden");
+      pickMarker = new BMapGL.Marker(map.getCenter(), { icon: dotIcon("#dc2626", 18) });
+      pickMarker.setLabel(new BMapGL.Label("新中心点", { position: map.getCenter(), offset: new BMapGL.Size(10, -22) }));
+      map.addOverlay(pickMarker);
+      overlays.push(pickMarker);
+      if (!pickHandlers) {
+        pickHandlers = {
+          click: onPickMapClick,
+          keydown: onPickKeydown
+        };
+      }
+      map.addEventListener("click", pickHandlers.click);
+      document.addEventListener("keydown", pickHandlers.keydown);
+    });
+  }
+
+  var pickHandlers = null;
+
+  function onPickKeydown(e) {
+    if (e && e.key === "Escape") exitPickCenter();
+  }
+
+  /* 把 lng/lat 设为计算中心点，并同步到输入框（单击地图 / 取点模式共用） */
+  function setCenterFromMap(lng, lat) {
+    $("addr-input").value = lng.toFixed(6) + "," + lat.toFixed(6);
+    showNotice("已设置计算中心点：" + lng.toFixed(6) + "," + lat.toFixed(6) + "，点击「计算等时圈」开始分析。", 6);
+  }
+
+  function onPickMapClick(e) {
+    if (!pickingCenter) return;
+    var lng = e.lnglat.lng, lat = e.lnglat.lat;
+    if (pickMarker) pickMarker.setPosition(new BMapGL.Point(lng, lat));
+    setCenterFromMap(lng, lat);
+  }
+
+  function exitPickCenter() {
+    if (!pickingCenter) return;
+    pickingCenter = false;
+    var btn = $("pick-center-btn");
+    btn.classList.remove("active");
+    btn.textContent = "取点设中心";
+    $("draw-hint").classList.add("hidden");
+    if (pickHandlers) {
+      map.removeEventListener("click", pickHandlers.click);
+      document.removeEventListener("keydown", pickHandlers.keydown);
+    }
+    if (pickMarker) {
+      try { map.removeOverlay(pickMarker); } catch (err) { /* 忽略 */ }
+      pickMarker = null;
+    }
+  }
+
   /* ---------------- 计算流程 ---------------- */
 
   $("sample-select").addEventListener("change", function () {
@@ -428,6 +555,7 @@
       walk_speed: parseFloat($("walk-speed").value) || 1.2,
       crossing_sec: parseInt($("crossing-sec").value, 10) || 0,
       overpass_sec: parseInt($("overpass-sec").value, 10) || 0,
+      heat_exact: $("heat-exact-cb").checked,
       obstacles: obstacles.map(function (poly) {
         return poly.map(function (p) { return { lng: p.lng, lat: p.lat }; });
       })
@@ -515,13 +643,16 @@
       overlays.push(poly);
     });
 
-    // v3 热力采样点（主圈内网格，颜色分级：≤5 绿 / ≤10 黄 / >10 橙 / 不可达深灰）
+    // v4 热力：真实路网耗时热力叠加层（Canvas 高斯叠加 → GroundOverlay）+ 小圆点辅助
+    renderHeatLayer(result.heat || []);
+
+    // 辅助圆点（覆盖热力叠加层之上，便于核对采样位置与分级）
     (result.heat || []).forEach(function (h) {
       var color = h.minutes == null ? "#374151"
         : h.minutes <= 5 ? "#22c55e"
         : h.minutes <= 10 ? "#eab308"
         : "#f97316";
-      var m = new BMapGL.Marker(new BMapGL.Point(h.lng, h.lat), { icon: dotIcon(color, 6) });
+      var m = new BMapGL.Marker(new BMapGL.Point(h.lng, h.lat), { icon: dotIcon(color, 5) });
       map.addOverlay(m);
       overlays.push(m);
     });
@@ -646,6 +777,81 @@
     renderReport(result);
   }
 
+  /* ---------------- v4：热力叠加层（Canvas 高斯叠加） ---------------- */
+
+  function heatColor(minutes, alpha) {
+    // 三阶渐变：绿(0~5) → 黄(5~10) → 橙(10~15) → 红(>15)
+    var stops = [
+      [0, [34, 197, 94]],
+      [5, [234, 179, 8]],
+      [10, [249, 115, 22]],
+      [15, [220, 38, 38]]
+    ];
+    var t = Math.max(0, Math.min(minutes, 20));
+    var col = stops[stops.length - 1][1];
+    for (var i = 1; i < stops.length; i++) {
+      if (t <= stops[i][0]) {
+        var a = stops[i - 1], b = stops[i];
+        var k = (t - a[0]) / Math.max(1e-6, b[0] - a[0]);
+        col = [
+          Math.round(a[1][0] + (b[1][0] - a[1][0]) * k),
+          Math.round(a[1][1] + (b[1][1] - a[1][1]) * k),
+          Math.round(a[1][2] + (b[1][2] - a[1][2]) * k)
+        ];
+        break;
+      }
+    }
+    return "rgba(" + col[0] + "," + col[1] + "," + col[2] + "," + alpha + ")";
+  }
+
+  function renderHeatLayer(heat) {
+    if (!map || !window.BMapGL || !BMapGL.GroundOverlay) return;
+    var ok = (heat || []).filter(function (h) { return h.minutes != null; });
+    if (!ok.length) return;
+    try {
+      var minLng = Infinity, minLat = Infinity, maxLng = -Infinity, maxLat = -Infinity;
+      ok.forEach(function (h) {
+        if (h.lng < minLng) minLng = h.lng;
+        if (h.lat < minLat) minLat = h.lat;
+        if (h.lng > maxLng) maxLng = h.lng;
+        if (h.lat > maxLat) maxLat = h.lat;
+      });
+      var midLat = (minLat + maxLat) / 2;
+      var lat1m = 1 / 111320;
+      var lng1m = 1 / (111320 * Math.cos(midLat * Math.PI / 180));
+      var wM = (maxLng - minLng) / lng1m;
+      var hM = (maxLat - minLat) / lat1m;
+      var W = 640;
+      var H = Math.max(48, Math.round(W * hM / Math.max(wM, 1e-6)));
+      var cv = document.createElement("canvas");
+      cv.width = W; cv.height = H;
+      var ctx = cv.getContext("2d");
+      var R = Math.max(8, Math.round(W / wM * 26));   // 高斯核半径 ≈ 26m 网格覆盖
+      ok.forEach(function (h) {
+        var x = (h.lng - minLng) / lng1m / wM * W;
+        var y = H - (h.lat - minLat) / lat1m / hM * H;
+        var g = ctx.createRadialGradient(x, y, 0, x, y, R);
+        g.addColorStop(0, heatColor(h.minutes, 0.62));
+        g.addColorStop(1, "rgba(0,0,0,0)");
+        ctx.fillStyle = g;
+        ctx.fillRect(x - R, y - R, R * 2, R * 2);
+      });
+      var url = cv.toDataURL("image/png");
+      var bounds = new BMapGL.Bounds(new BMapGL.Point(minLng, minLat), new BMapGL.Point(maxLng, maxLat));
+      heatLayer = new BMapGL.GroundOverlay(bounds, {
+        type: "image",
+        url: url,
+        opacity: 0.62,
+        clickable: false
+      });
+      map.addOverlay(heatLayer);
+      overlays.push(heatLayer);
+    } catch (e) {
+      heatLayer = null;
+      console.warn("热力叠加层渲染失败，已保留采样圆点：", e);
+    }
+  }
+
   function levelText(level) {
     return level === "high" ? "高" : level === "mid" ? "中" : "低";
   }
@@ -687,12 +893,25 @@
     }
     $("kpis").innerHTML = kpiHtml;
 
-    // 热力说明（报告标注：热力为网格采样）
+    // POI 配额提示：百度 302/401 超限时设施统计为空，明确告知而非显示为 0
+    var pw = $("poi-warning");
+    var poiWarn = meta.poi_warning || {};
+    if (!r.poi_total && (poiWarn.quota_exhausted || r.health_index === 0 && r.satisfied_count === 0)) {
+      pw.textContent = poiWarn.message || "未能获取周边设施（POI）数据，设备统计与健康指数暂不可用。请稍后重试或更换密钥。";
+      pw.classList.remove("hidden");
+    } else if (r.poi_total) {
+      pw.classList.add("hidden");
+    }
+
+    // 热力说明（报告标注：热力为网格采样 + 实际精度）
     var hn = $("heat-note");
     if (r.heat && r.heat.length) {
       hn.classList.remove("hidden");
-      hn.textContent = "热力为网格采样（约 " + (hs.step_m || 100) + " m 步长）" +
-        (meta.heat_exact === false ? "，已按射线插值估算（节省 API 配额）。" : "，已按步行 API 精确计算（含过街模型）。");
+      var hMode = hs.heat_mode || (meta.heat_exact === false ? "interp" : "exact");
+      var hTxt = hMode === "interp" ? "已按射线插值估算（不增加 API 配额）。"
+        : hMode === "exact+interp" ? "步行 API 精确计算为主，个别失败点已用射线插值补齐。"
+          : "已按步行 API 精确计算（含过街模型）。";
+      hn.textContent = "热力为网格采样（约 " + (hs.step_m || 100) + " m 步长）" + hTxt;
     } else {
       hn.classList.add("hidden");
     }
@@ -712,8 +931,10 @@
       tbody.appendChild(tr);
     });
 
-    // Canvas 条形图
+    // Canvas 条形图 + v4 雷达图 + 健康指数仪表盘
     drawBarChart(r.categories || [], r.health_index);
+    drawRadarChart(r.categories || []);
+    drawGauge(r.health_index || 0);
 
     // 问题清单（灰色区域自动诊疗）
     var gb = $("gray-block");
@@ -809,7 +1030,9 @@
     }
     if (meta.v3) {
       notes.push("热力为网格采样（约 " + (r.heat_stats && r.heat_stats.step_m || 100) + " m 步长）" +
-        (meta.heat_exact === false ? "，按射线插值估算（节省 API 配额）。" : "，按步行 API 精确计算（含过街模型）。") +
+        ((r.heat_stats && r.heat_stats.heat_mode) === "interp" ? "按射线插值估算（节省 API 配额）。"
+          : (r.heat_stats && r.heat_stats.heat_mode) === "exact+interp" ? "步行 API 精确计算为主，失败点已射线插值补齐。"
+          : "按步行 API 精确计算（含过街模型）。") +
         " 盲区核验为 1km 直线口径（菜市场/药店/小学），与灰色区域（500m 网格覆盖分析）口径不同、两者并存。");
     }
     if (notes.length) {
@@ -836,6 +1059,136 @@
     if (m2 == null) return "0 m²";
     if (m2 >= 1e6) return (m2 / 1e6).toFixed(2) + " km²";
     return Math.round(m2) + " m²";
+  }
+
+  /* v4 雷达图：8 类设施覆盖度（达标=满值，未达标按 数量/阈值 归一化） */
+  function drawRadarChart(categories) {
+    var canvas = $("radar-canvas");
+    if (!canvas) return;
+    var dpr = window.devicePixelRatio || 1;
+    var cssW = canvas.clientWidth || 300;
+    var cssH = 240;
+    canvas.width = cssW * dpr;
+    canvas.height = cssH * dpr;
+    canvas.style.width = cssW + "px";
+    canvas.style.height = cssH + "px";
+    var ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssW, cssH);
+
+    var n = categories.length;
+    if (!n) return;
+    var cx = cssW / 2, cy = cssH / 2 + 8;
+    var R = Math.min(cssW, cssH) / 2 - 30;
+    var padT = 26;
+    var valueOf = function (c) {
+      if (c.satisfied) return 1;
+      return Math.min(0.15 + c.count / Math.max(c.threshold, 1) * 0.85, 0.55);
+    };
+
+    function pt(i, v) {
+      var a = -Math.PI / 2 + i * 2 * Math.PI / n;
+      return [cx + Math.cos(a) * R * v, cy + Math.sin(a) * R * v];
+    }
+
+    // 网格（0.25/0.5/0.75/1.0）
+    ctx.strokeStyle = "#e2e8f0";
+    ctx.lineWidth = 1;
+    for (var g = 0.25; g <= 1.001; g += 0.25) {
+      ctx.beginPath();
+      for (var i = 0; i <= n; i++) {
+        var p = pt(i % n, g);
+        if (i === 0) ctx.moveTo(p[0], p[1]); else ctx.lineTo(p[0], p[1]);
+      }
+      ctx.stroke();
+    }
+    // 轴线
+    ctx.strokeStyle = "#cbd5e1";
+    for (var j = 0; j < n; j++) {
+      var a2 = pt(j, 1);
+      var a1 = pt(j, 0);
+      ctx.beginPath();
+      ctx.moveTo(a1[0], a1[1]);
+      ctx.lineTo(a2[0], a2[1]);
+      ctx.stroke();
+    }
+    // 数据多边形
+    ctx.beginPath();
+    for (var k = 0; k < n; k++) {
+      var dp = pt(k, valueOf(categories[k]));
+      if (k === 0) ctx.moveTo(dp[0], dp[1]); else ctx.lineTo(dp[0], dp[1]);
+    }
+    ctx.closePath();
+    ctx.fillStyle = "rgba(59,130,246,0.22)";
+    ctx.fill();
+    ctx.strokeStyle = "#3b82f6";
+    ctx.lineWidth = 1.6;
+    ctx.stroke();
+    // 顶点 + 标签
+    ctx.font = "11px sans-serif";
+    ctx.textAlign = "center";
+    categories.forEach(function (c, i) {
+      var dp = pt(i, valueOf(c));
+      ctx.fillStyle = c.color || "#3b82f6";
+      ctx.beginPath();
+      ctx.arc(dp[0], dp[1], 3, 0, 2 * Math.PI);
+      ctx.fill();
+      var lp = pt(i, 1.18);
+      ctx.fillStyle = "#334155";
+      ctx.fillText(c.name.length > 2 ? c.name.slice(0, 2) : c.name, lp[0], lp[1] + 4);
+    });
+    ctx.fillStyle = "#64748b";
+    ctx.font = "12px sans-serif";
+    ctx.fillText("8 类设施覆盖度（外圈=达标）", cx, 16);
+  }
+
+  /* v4 健康指数仪表盘：270° 环形进度 */
+  function drawGauge(health) {
+    var canvas = $("gauge-canvas");
+    if (!canvas) return;
+    var dpr = window.devicePixelRatio || 1;
+    var cssW = canvas.clientWidth || 200;
+    var cssH = 160;
+    canvas.width = cssW * dpr;
+    canvas.height = cssH * dpr;
+    canvas.style.width = cssW + "px";
+    canvas.style.height = cssH + "px";
+    var ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssW, cssH);
+
+    var cx = cssW / 2, cy = cssH - 28;
+    var R = Math.min(cssW / 2 - 14, cssH - 46);
+    var start = Math.PI * 0.75, end = Math.PI * 2.25;   // 270°
+    var frac = Math.max(0, Math.min(health / 100, 1));
+
+    function arc(a0, a1, color, width) {
+      ctx.beginPath();
+      ctx.arc(cx, cy, R, a0, a1);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width;
+      ctx.lineCap = "round";
+      ctx.stroke();
+    }
+    arc(start, end, "#e5e7eb", 16);
+    var col = health >= 70 ? "#22c55e" : health >= 50 ? "#eab308" : "#ef4444";
+    arc(start, start + (end - start) * frac, col, 16);
+    // 刻度
+    for (var i = 0; i <= 5; i++) {
+      var a = start + (end - start) * i / 5;
+      arc(a, a - 0.02, "#ffffff", 2);
+    }
+    // 数值与标签
+    ctx.fillStyle = col;
+    ctx.font = "bold 30px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(String(Math.round(health)), cx, cy - 8);
+    ctx.fillStyle = "#475569";
+    ctx.font = "12px sans-serif";
+    ctx.fillText("健康指数（满分 100）", cx, cy + 24);
+    var v = health >= 70 ? "宜居便利" : health >= 50 ? "基本可用" : "设施匮乏";
+    ctx.fillStyle = col;
+    ctx.fillText(v, cx, cy + 42);
   }
 
   /* 手绘 Canvas 条形图：8 类数量柱状图，带坐标轴和数值 */

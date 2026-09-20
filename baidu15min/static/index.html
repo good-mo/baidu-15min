@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>15分钟便民生活圈体检报告 v3</title>
   <link rel="stylesheet" href="/static/style.css">
+  <!-- 百度地图 JS API（服务端渲染时注入 AK；必须同步加载，避免 document.write 被异步拦截） -->
+  __BAIDU_SDK__
 </head>
 <body>
 
@@ -50,7 +52,9 @@
         </select>
       </label>
       <button id="calc-btn">计算等时圈</button>
+      <button id="pick-center-btn" class="ghost-btn">取点设中心</button>
       <button id="draw-obstacle-btn" class="ghost-btn">添加障碍区</button>
+      <label class="inline-check"><input type="checkbox" id="heat-exact-cb" checked> 热力精确</label>
       <label class="inline-check"><input type="checkbox" id="traffic-cb"> 路况</label>
     </div>
   </header>
@@ -85,7 +89,7 @@
       <div id="map" class="map-canvas"></div>
       <div id="legend" class="legend hidden">
         <div class="legend-title">图例</div>
-        <div class="legend-items"></div>
+        <div id="legend-items" class="legend-items"></div>
         <div class="legend-note">
           半透明蓝色为步行等时圈（多圈时颜色越深分钟越大）；
           灰色块为设施匮乏的灰色区域；深灰多边形为模拟障碍区；
@@ -105,7 +109,20 @@
 
       <div id="kpis" class="kpis"></div>
 
+      <div id="poi-warning" class="poi-warning hidden"></div>
+
       <div id="heat-note" class="heat-note hidden"></div>
+
+      <div class="block charts-row">
+        <div class="chart-card">
+          <h3>健康指数仪表盘</h3>
+          <canvas id="gauge-canvas" width="200" height="160"></canvas>
+        </div>
+        <div class="chart-card">
+          <h3>8 类设施达标雷达图</h3>
+          <canvas id="radar-canvas" width="300" height="240"></canvas>
+        </div>
+      </div>
 
       <div class="block">
         <h3>分类达标情况</h3>

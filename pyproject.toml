@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "baidu-15min"
+version = "4.0.0"
+description = "15分钟便民生活圈体检报告：等时圈、POI 覆盖、灰色区域、1km 服务盲区与健康指数"
+requires-python = ">=3.9"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "httpx",
+    "requests",
+]
+
+[tool.setuptools]
+packages = ["baidu15min", "baidu15min.api", "baidu15min.core"]
