@@ -515,6 +515,13 @@
   function setCenterFromMap(lng, lat) {
     $("addr-input").value = lng.toFixed(6) + "," + lat.toFixed(6);
     showNotice("已设置计算中心点：" + lng.toFixed(6) + "," + lat.toFixed(6) + "，点击「计算等时圈」开始分析。", 6);
+    fetchJson("/api/reverse?lng=" + lng + "&lat=" + lat)
+      .then(function (r) {
+        if (r && r.formatted_address) {
+          $("addr-input").value = r.formatted_address + "（" + lng.toFixed(6) + "," + lat.toFixed(6) + "）";
+        }
+      })
+      .catch(function () { /* 逆地理编码失败时保留经纬度 */ });
   }
 
   /* 事件对象容错取经纬度：兼容 BMapGL(e.latlng) / BMap 3.0(e.lnglat) / 传统 BMap(e.point) */
