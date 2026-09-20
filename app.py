@@ -612,6 +612,187 @@ def _poly_to_tuples(poly):
 
 
 # ---------------------------------------------------------------------------
+# v3：等时圈热力图（网格采样）+ 1公里服务盲区核验
+# ---------------------------------------------------------------------------
+# 坐标转换（百度 geoconv）：from 值映射表
+GEO_CONV_FROM = {"wgs84": 1, "gcj02": 3, "bd09ll": 5}
+
+# 热力图参数
+HEAT_MAX_POINTS = 120      # 热力网格点数上限（超限自动放大步长）
+HEAT_BASE_STEP = 100.0     # 热力网格基础步长（米）
+
+# 1公里服务盲区核验参数（评分口径）
+BLIND_GRID_STEP = 150.0    # 盲区网格点步长（米）
+BLIND_RADIUS = 1000.0      # 盲区判定半径（米）
+BLIND_CATEGORIES = ["菜市场", "药店", "小学"]
+BLIND_MAX_GRID = 1500      # 网格候选点保护上限
+# 盲区设施提取规则：(输出名, POI类别, 名称包含关键词)
+BLIND_FACILITY_RULES = [
+    ("菜市场", "商业", ["菜市场"]),
+    ("药店", "医疗", ["药店"]),
+    ("小学", "教育", ["小学"]),
+]
+
+
+def compute_heat(center, boundary, minutes, rays, crossing_sec, overpass_sec,
+                 obstacles=None, exact=True, max_points=HEAT_MAX_POINTS):
+    """
+    等时圈热力图：主圈 bbox 内按 100m 网格取多边形内点（点数超上限自动放大步长）。
+      - exact=True（默认）：调一次步行 API（复用缓存）取 effective_duration 换算分钟；
+      - exact=False（节省模式）：按点相对中心的角度，在相邻两条射线的边界半径之间
+        线性插值出边界半径，再按 半径/边界半径 × minutes 估算分钟数，不增加 API 调用。
+    返回 (heat_list, step_used)；heat = [{lng, lat, minutes} | minutes=None(不可达/失败)]。
+    """
+    obstacles = obstacles or []
+    min_lng, min_lat, max_lng, max_lat = bbox_of(boundary)
+    lat1m = LAT_1M
+    lng1m = _lng_1m(center[1])
+
+    # 网格采样：步长 100m 起步，点数超限自动放大步长重取
+    factor = 1
+    pts = []
+    step = HEAT_BASE_STEP
+    while True:
+        step = HEAT_BASE_STEP * factor
+        cols = int(math.ceil((max_lng - min_lng) / (step * lng1m))) + 1
+        rows = int(math.ceil((max_lat - min_lat) / (step * lat1m))) + 1
+        pts = []
+        if 0 < rows <= 400 and 0 < cols <= 400:
+            for r in range(rows):
+                lat = min_lat + r * step * lat1m
+                for c in range(cols):
+                    lng = min_lng + c * step * lng1m
+                    if point_in_polygon(lng, lat, boundary):
+                        pts.append((lng, lat))
+        if len(pts) <= max_points or factor >= 5:
+            break
+        factor += 1
+
+    heat = []
+    if exact:
+        for (lng, lat) in pts:
+            if segment_hits_obstacles(center, (lng, lat), obstacles):
+                heat.append({"lng": round(lng, 6), "lat": round(lat, 6), "minutes": None})
+                continue
+            eff, _, _, _, _ = walking_duration(center, (lng, lat), crossing_sec, overpass_sec)
+            m = round(eff / 60.0, 1) if eff < INF_TRAVEL else None
+            heat.append({
+                "lng": round(lng, 6), "lat": round(lat, 6),
+                "minutes": min(m, 40.0) if m is not None else None,
+            })
+    else:
+        # 射线插值：按角度重建每条射线的边界半径（防御 boundary 点数不足/乱序）
+        ray_radii = [0.0] * rays
+        step_ang = 2.0 * math.pi / rays
+        for p in boundary:
+            a_ang = math.atan2((p[1] - center[1]) / lat1m, (p[0] - center[0]) / lng1m)
+            if a_ang < 0:
+                a_ang += 2.0 * math.pi
+            idx = int(a_ang / step_ang) % rays
+            r_now = math.hypot((p[0] - center[0]) / lng1m, (p[1] - center[1]) / lat1m)
+            if r_now > ray_radii[idx]:
+                ray_radii[idx] = r_now
+        for (lng, lat) in pts:
+            radius_p = math.hypot((lng - center[0]) / lng1m, (lat - center[1]) / lat1m)
+            a = math.atan2((lat - center[1]) / lat1m, (lng - center[0]) / lng1m)
+            if a < 0:
+                a += 2.0 * math.pi
+            idx = int(a / step_ang) % rays
+            f = (a - idx * step_ang) / step_ang
+            r_b = ray_radii[idx] + (ray_radii[(idx + 1) % rays] - ray_radii[idx]) * f
+            if r_b <= 1e-9:
+                heat.append({"lng": round(lng, 6), "lat": round(lat, 6), "minutes": None})
+            else:
+                m = minutes * radius_p / r_b
+                m = min(max(m, 0.1), 40.0)
+                heat.append({"lng": round(lng, 6), "lat": round(lat, 6), "minutes": round(m, 1)})
+    return heat, step
+
+
+def detect_blind_spots(center, boundary, all_pois, residential_pois=None):
+    """
+    1公里服务盲区核验（评分口径，与 v2 灰色区域并存互不影响）：
+      对候选点检查其 1km（直线）内是否有【菜市场】【药店】【小学】三类设施；
+      三类全部没有 → 判为「服务盲区点位」。
+      候选来源：
+        1) 住宅小区 POI（category=住宅）；
+        2) 等时圈内网格点（步长 150m）。
+      设施直接取自已收集 POI（菜市场=商业类含「菜市场」、药店=医疗类含「药店」、
+      小学=教育类含「小学」），不额外调用接口。
+    """
+    # 设施池
+    fac_pools = [[] for _ in BLIND_FACILITY_RULES]
+    for poi in all_pois:
+        cname = poi.get("category", "") or ""
+        name = poi.get("name", "") or ""
+        for i, (_label, cat_key, kws) in enumerate(BLIND_FACILITY_RULES):
+            if cname == cat_key and any(kw in name for kw in kws):
+                fac_pools[i].append(poi)
+                break
+
+    def nearest_m(label_idx, lng, lat):
+        """该类最近设施直线距离（米）；该类别无任何设施返回 None（视为缺失）"""
+        pool = fac_pools[label_idx]
+        if not pool:
+            return None
+        best = float("inf")
+        for p in pool:
+            d = _haversine_km(lat, lng, p["lat"], p["lng"]) * 1000.0
+            if d < best:
+                best = d
+        return best
+
+    # 候选点：住宅 POI + 网格点
+    candidates = [(rp["lng"], rp["lat"], "住宅小区") for rp in (residential_pois or [])]
+    min_lng, min_lat, max_lng, max_lat = bbox_of(boundary)
+    lat1m = LAT_1M
+    lng1m = _lng_1m(center[1])
+    step = BLIND_GRID_STEP
+    cols = int(math.ceil((max_lng - min_lng) / (step * lng1m))) + 1
+    rows = int(math.ceil((max_lat - min_lat) / (step * lat1m))) + 1
+    grid_added = 0
+    if 0 < rows <= 400 and 0 < cols <= 400:
+        for r in range(rows):
+            lat = min_lat + r * step * lat1m
+            for c in range(cols):
+                lng = min_lng + c * step * lng1m
+                if point_in_polygon(lng, lat, boundary):
+                    candidates.append((lng, lat, "网格点"))
+                    grid_added += 1
+                    if grid_added >= BLIND_MAX_GRID:
+                        break
+            if grid_added >= BLIND_MAX_GRID:
+                break
+
+    points = []
+    housing_count = 0
+    for (lng, lat, source) in candidates:
+        nearest_map = {}
+        has_nearby = False   # 三类中是否至少一类在 1km 内
+        for i, label in enumerate(BLIND_CATEGORIES):
+            d = nearest_m(i, lng, lat)
+            nearest_map[label] = None if d is None else round(d, 1)
+            if d is not None and d <= BLIND_RADIUS:
+                has_nearby = True
+        if has_nearby:
+            continue   # 1km 内有三类设施之一 → 非盲区
+        points.append({
+            "lng": round(lng, 6),
+            "lat": round(lat, 6),
+            "source": source,
+            "nearest": nearest_map,
+        })
+        if source == "住宅小区":
+            housing_count += 1
+
+    return {
+        "count": len(points),
+        "affected_housing_count": housing_count,
+        "points": points,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 报告生成（任务执行体）
 # ---------------------------------------------------------------------------
 def build_report(job):
@@ -630,6 +811,7 @@ def build_report(job):
     crossing_sec = job["crossing_sec"]
     overpass_sec = job["overpass_sec"]
     obstacles = [_poly_to_tuples(poly) for poly in (job["obstacles"] or [])]
+    heat_exact = bool(job.get("heat_exact", True))
     total_rays = len(minutes_list) * rays
 
     def progress(ring_idx, i, total):
@@ -744,6 +926,26 @@ def build_report(job):
                 satisfied_count += 1
         health_index = round(health_index, 1)
 
+        # ---- v3 等时圈热力图（主圈网格采样） ----
+        job["stage"] = "计算热力图…"
+        heat_list, heat_step = compute_heat(
+            center, main_boundary, main_ring["minutes"], rays,
+            crossing_sec, overpass_sec, obstacles=obstacles,
+            exact=heat_exact, max_points=HEAT_MAX_POINTS,
+        )
+        heat_vals = [h["minutes"] for h in heat_list if h["minutes"] is not None]
+        heat_stats = {
+            "points": len(heat_list),
+            "sampled": len(heat_vals),
+            "step_m": heat_step,
+            "avg_minutes": round(sum(heat_vals) / len(heat_vals), 1) if heat_vals else None,
+            "gt10_ratio": round(len([v for v in heat_vals if v > 10.0]) / len(heat_vals), 4) if heat_vals else 0.0,
+        }
+
+        # ---- v3 1公里服务盲区核验 ----
+        job["stage"] = "核验 1km 服务盲区…"
+        blind_spots = detect_blind_spots(center, main_boundary, all_pois, residential_pois)
+
         # ---- 灰色区域自动诊疗 ----
         job["stage"] = "检测灰色区域…"
         gray_areas = detect_gray_areas(main_boundary, all_pois, center[1], residential_pois)
@@ -752,7 +954,7 @@ def build_report(job):
         gray_ratio = round(gray_total_m2 / (main_ring["area_km2"] * 1e6), 4) if main_ring["area_km2"] > 0 else 0
 
         # ---- 结论建议（灰色区域按优先级排序在前） ----
-        suggestions, verdict = build_suggestions(categories_report, gray_areas, health_index)
+        suggestions, verdict = build_suggestions(categories_report, gray_areas, health_index, blind_spots)
 
         result = {
             "center": {"lng": center[0], "lat": center[1]},
@@ -782,12 +984,18 @@ def build_report(job):
                 "ratio": gray_ratio,
             }},
             "gray_stats": {"count": gray_count, "total_area_m2": gray_total_m2, "ratio": gray_ratio},
+            # v3 热力图 + 1km 服务盲区
+            "heat": heat_list,
+            "heat_stats": heat_stats,
+            "blind_spots": blind_spots,
             # 结论
             "suggestions": suggestions,
             "verdict": verdict,
             # v2 元信息（诚实标注估算）
             "meta": {
                 "v2": True,
+                "v3": True,
+                "heat_exact": heat_exact,
                 "walk_speed": walk_speed,
                 "crossing_sec": crossing_sec,
                 "overpass_sec": overpass_sec,
@@ -804,7 +1012,7 @@ def build_report(job):
         job["message"] = "计算失败：%s" % exc
 
 
-def build_suggestions(categories_report, gray_areas, health_index):
+def build_suggestions(categories_report, gray_areas, health_index, blind_spots=None):
     """规则生成中文建议（灰色区域按优先级排序在前，最多 6 条）+ 一句话总评"""
     suggestions = []
     template = {
@@ -826,6 +1034,10 @@ def build_suggestions(categories_report, gray_areas, health_index):
     for rep in categories_report:
         if not rep["satisfied"]:
             suggestions.append(template.get(rep["name"], rep["name"] + "设施不足。"))
+    if blind_spots and blind_spots.get("affected_housing_count", 0) > 0:
+        suggestions.append(
+            "1km 服务盲区：%d 个住宅小区 1 公里内无菜市场/药店/小学，建议优先布局社区菜场与便民药房。"
+            % blind_spots["affected_housing_count"])
     if len(suggestions) < 2:
         suggestions.append("建议持续跟踪等时圈内 POI 数据变化，定期评估便民设施覆盖情况。")
     suggestions = suggestions[:6]
@@ -870,6 +1082,8 @@ def api_config():
             "crossing_sec": DEFAULT_CROSSING_SEC,
             "overpass_sec": DEFAULT_OVERPASS_SEC,
         },
+        "blind_spot_radius": BLIND_RADIUS,
+        "blind_spot_categories": BLIND_CATEGORIES,
     })
 
 
@@ -901,6 +1115,72 @@ def api_reverse():
     if not result:
         return jsonify({"error": "逆地理编码失败，请检查坐标或百度地图密钥配置"}), 502
     return jsonify(result)
+
+
+@app.route("/api/coords/convert")
+def api_coords_convert():
+    """
+    坐标转换（v3）：调用百度 geoconv/v1。
+    参数：coords=<lng>,<lat>[;<lng>,<lat>...]（最多 50 个，顺序为经度,纬度）、
+          from ∈ {wgs84, gcj02, bd09ll}（默认 wgs84），统一转为 BD-09(to=5)。
+    返回 {status, coords: [{lng,lat},...]}；百度 status!=0 或网络失败返回 {error}。
+    """
+    raw = (request.args.get("coords") or "").strip()
+    if not raw:
+        return jsonify({"error": "缺少 coords 参数（lng,lat;lng,lat…）"}), 400
+    from_key = (request.args.get("from") or "wgs84").strip().lower()
+    if from_key not in GEO_CONV_FROM:
+        return jsonify({"error": "from 仅支持 wgs84/gcj02/bd09ll"}), 400
+    try:
+        pairs = []
+        for chunk in raw.split(";"):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            parts = chunk.split(",")
+            if len(parts) != 2:
+                return jsonify({"error": "coords 每项需为 lng,lat"}), 400
+            pairs.append([float(parts[0]), float(parts[1])])
+    except (TypeError, ValueError):
+        return jsonify({"error": "coords 坐标值非法"}), 400
+    if not pairs or len(pairs) > 50:
+        return jsonify({"error": "coords 需为 1-50 个 lng,lat 点"}), 400
+    if from_key == "bd09ll":
+        # BD-09 转 BD-09 无意义，直接回显
+        return jsonify({"status": 0, "from": from_key,
+                        "coords": [{"lng": p[0], "lat": p[1]} for p in pairs]})
+    if not BAIDU_AK:
+        return jsonify({"error": "请在环境变量 BAIDU_MAP_AK 配置百度地图密钥后重试。"}), 502
+    try:
+        pairs = []
+        for chunk in raw.split(";"):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            parts = chunk.split(",")
+            if len(parts) != 2:
+                return jsonify({"error": "coords 每项需为 lng,lat"}), 400
+            pairs.append([float(parts[0]), float(parts[1])])
+    except (TypeError, ValueError):
+        return jsonify({"error": "coords 坐标值非法"}), 400
+    if not pairs or len(pairs) > 50:
+        return jsonify({"error": "coords 需为 1-50 个 lng,lat 点"}), 400
+    try:
+        data = baidu_get("/geoconv/v1/", {
+            "coords": ";".join("%s,%s" % (p[0], p[1]) for p in pairs),
+            "from": GEO_CONV_FROM[from_key],
+            "to": 5,
+        })
+    except Exception as exc:
+        return jsonify({"error": "坐标转换失败：%s" % exc}), 502
+    if not data or data.get("status") != 0:
+        return jsonify({"error": "坐标转换失败：%s" % ((data or {}).get("message") or "status!=0")}), 502
+    results = data.get("result") or []
+    return jsonify({
+        "status": 0,
+        "from": from_key,
+        "coords": [{"lng": float(r["x"]), "lat": float(r["y"])} for r in results],
+    })
 
 
 def _norm_obstacles(obstacles):
@@ -969,11 +1249,17 @@ def api_isochrone():
     obstacles = _norm_obstacles(body.get("obstacles"))
     if obstacles is None:
         return jsonify({"error": "obstacles 参数格式非法（应为若干 {lng,lat} 多边形）"}), 400
+    # heat_exact=v3 热力图采样模式：true 调步行 API 精确计算，false 走射线插值（不额外调接口）
+    heat_exact_raw = body.get("heat_exact", True)
+    if not isinstance(heat_exact_raw, bool):
+        return jsonify({"error": "heat_exact 需为布尔值"}), 400
+    heat_exact = heat_exact_raw
 
     cache_key = (
         round(lng, 6), round(lat, 6), tuple(minutes_list), rays, steps,
         walk_speed, crossing_sec, overpass_sec,
         tuple(tuple(poly) for poly in obstacles),
+        heat_exact,
     )
     with _jobs_lock:
         cached_job_id = _results_cache.get(cache_key)
@@ -995,6 +1281,7 @@ def api_isochrone():
             "crossing_sec": crossing_sec,
             "overpass_sec": overpass_sec,
             "obstacles": obstacles,
+            "heat_exact": heat_exact,
             "status": "queued",
             "progress": 0,
             "stage": "排队中…",
@@ -1061,7 +1348,7 @@ def main():
     parser = argparse.ArgumentParser(description="15分钟便民生活圈体检报告 v2")
     parser.add_argument("--port", type=int, default=5000, help="监听端口（默认 5000）")
     args = parser.parse_args()
-    print("15分钟便民生活圈服务 v2 启动，监听 0.0.0.0:%d，ak_configured=%s" % (args.port, bool(BAIDU_AK)))
+    print("15分钟便民生活圈服务 v3 启动，监听 0.0.0.0:%d，ak_configured=%s" % (args.port, bool(BAIDU_AK)))
     app.run(host="0.0.0.0", port=args.port, debug=False, threaded=True)
 
 

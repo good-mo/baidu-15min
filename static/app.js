@@ -1,6 +1,7 @@
-/* 15分钟便民生活圈体检报告 v2 — 前端逻辑（原生 JS + BMapGL）
+/* 15分钟便民生活圈体检报告 v3 — 前端逻辑（原生 JS + BMapGL）
    v1 功能（单圈/POI/灰色区域/健康指数）+ v2 功能（多时圈/阻抗系数/
-   过街模型参数/障碍绘制/路况图层/问题清单诊疗） */
+   过街模型参数/障碍绘制/路况图层/问题清单诊疗）
+   + v3 功能（坐标系下拉与坐标转换/等时圈热力图/1km 服务盲区核验） */
 (function () {
   "use strict";
 
@@ -9,6 +10,10 @@
   var overlays = [];          // 所有动态覆盖物
   var currentResult = null;
   var pollTimer = null;
+
+  // v3 坐标系状态（默认 BD-09，样例街道固定 BD-09 不转换）
+  var coordSys = "bd09ll";
+  var COORD_SYS_LABEL = { bd09ll: "BD-09", gcj02: "GCJ-02", wgs84: "WGS-84" };
 
   // v2 障碍区状态
   var obstacles = [];         // [[{lng,lat},...], ...]
@@ -51,6 +56,21 @@
       anchor: new BMapGL.Size(size / 2, size / 2)
     });
     return icon;
+  }
+
+  /* v3：红色感叹号图标（较大=住宅小区源，较小=网格源） */
+  function blindIcon(big) {
+    var size = big ? 18 : 12;
+    var svg =
+      '<svg xmlns="http://www.w3.org/2000/svg" width="' + size + '" height="' + size + '">' +
+      '<circle cx="' + size / 2 + '" cy="' + size / 2 + '" r="' + (size / 2 - 1) +
+      '" fill="#dc2626" stroke="#ffffff" stroke-width="1"/>' +
+      '<text x="' + size / 2 + '" y="' + (size * 0.78) + '" font-size="' + (size * 0.68) +
+      '" font-weight="bold" fill="#ffffff" text-anchor="middle">!</text></svg>';
+    var url = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
+    return new BMapGL.Icon(url, new BMapGL.Size(size, size), {
+      anchor: new BMapGL.Size(size / 2, size / 2)
+    });
   }
 
   /* 解析输入：优先 lng,lat 坐标，否则视为地址文本 */
@@ -178,6 +198,21 @@
       div.appendChild(document.createTextNode("住宅（辅助）"));
       items.appendChild(div);
     }
+    // v3：热力色阶 + 盲区
+    [["#22c55e", "≤5 分钟（热力）"], ["#eab308", "≤10 分钟"], ["#f97316", "&gt;10 分钟"], ["#374151", "不可达"]].forEach(function (row) {
+      var div = document.createElement("div");
+      div.className = "legend-item";
+      var sq = document.createElement("span");
+      sq.className = "legend-sq";
+      sq.style.background = row[0];
+      div.appendChild(sq);
+      div.appendChild(document.createTextNode(row[1]));
+      items.appendChild(div);
+    });
+    var bd = document.createElement("div");
+    bd.className = "legend-item";
+    bd.innerHTML = "<span style='color:#dc2626;font-weight:800'>!</span> 1km 服务盲区";
+    items.appendChild(bd);
   }
 
   /* v2：路况图层（视觉参考，不参与耗时计算）。
@@ -336,17 +371,44 @@
     if (!text) { showNotice("请先输入地址或经纬度。", 6); return; }
     var coord = parseInput(text);
     if (coord) {
-      startCalc(coord.lng, coord.lat);
+      ensureBd09(coord.lng, coord.lat, function (lng, lat) { startCalc(lng, lat); });
     } else {
       fetchJson("/api/geocode?address=" + encodeURIComponent(text))
         .then(function (g) {
-          startCalc(g.lng, g.lat);
+          ensureBd09(g.lng, g.lat, function (lng, lat) { startCalc(lng, lat); });
         })
         .catch(function (err) {
           showNotice(err.message || "地址解析失败，请检查输入。", 8);
         });
     }
   });
+
+  // v3：坐标系下拉（仅影响「输入坐标 / 地址解析结果」的换算；样例街道固定 BD-09 不转换）
+  $("coord-sys-select").addEventListener("change", function () {
+    coordSys = this.value;
+    var label = COORD_SYS_LABEL[coordSys] || coordSys;
+    if (coordSys === "bd09ll") {
+      showNotice("坐标系已切换为 BD-09（百度，默认），无需转换。", 4);
+    } else {
+      showNotice("当前坐标系为 " + label + "，计算时将自动调用百度 geoconv 转换为 BD-09。", 5);
+    }
+  });
+
+  // v3：非 BD-09 坐标 → 调用 /api/coords/convert 统一转 BD-09 后再计算
+  function ensureBd09(lng, lat, cb) {
+    if (coordSys === "bd09ll") { cb(lng, lat); return; }
+    fetchJson("/api/coords/convert?coords=" + lng + "," + lat + "&from=" + coordSys)
+      .then(function (res) {
+        if (!res.coords || !res.coords.length) throw new Error("坐标转换无返回结果");
+        var c = res.coords[0];
+        showNotice("已将 " + (COORD_SYS_LABEL[coordSys] || coordSys) + " 坐标转换为 BD-09：" +
+          c.lng.toFixed(6) + "," + c.lat.toFixed(6), 6);
+        cb(c.lng, c.lat);
+      })
+      .catch(function (err) {
+        showNotice("坐标转换失败：" + err.message + "（无百度密钥时请输入 BD-09 坐标）", 9);
+      });
+  }
 
   function startCalc(lng, lat) {
     hideNotice();
@@ -453,6 +515,17 @@
       overlays.push(poly);
     });
 
+    // v3 热力采样点（主圈内网格，颜色分级：≤5 绿 / ≤10 黄 / >10 橙 / 不可达深灰）
+    (result.heat || []).forEach(function (h) {
+      var color = h.minutes == null ? "#374151"
+        : h.minutes <= 5 ? "#22c55e"
+        : h.minutes <= 10 ? "#eab308"
+        : "#f97316";
+      var m = new BMapGL.Marker(new BMapGL.Point(h.lng, h.lat), { icon: dotIcon(color, 6) });
+      map.addOverlay(m);
+      overlays.push(m);
+    });
+
     // 中心点红色图钉 + 标签
     var centerPt = new BMapGL.Point(center.lng, center.lat);
     var marker = new BMapGL.Marker(centerPt, { icon: dotIcon("#dc2626", 18) });
@@ -543,6 +616,32 @@
       overlays.push(pg);
     });
 
+    // v3 1km 服务盲区标记（红色感叹号；住宅源大、网格源小，点击查看三类设施最近距离）
+    (result.blind_spots && result.blind_spots.points || []).forEach(function (b) {
+      var big = b.source === "住宅小区";
+      var m = new BMapGL.Marker(new BMapGL.Point(b.lng, b.lat), { icon: blindIcon(big) });
+      m.addEventListener("click", (function (pt) {
+        return function () {
+          var near = pt.nearest || {};
+          var rows = (config.blind_spot_categories || ["菜市场", "药店", "小学"]).map(function (c) {
+            var d = near[c];
+            return c + "：" + (d != null ? (d >= 1000 ? (d / 1000).toFixed(2) + " km" : Math.round(d) + " m") : "无");
+          }).join(" / ");
+          var win = new BMapGL.InfoWindow(
+            "<div style='font-size:12px;line-height:1.8'><b>1km 服务盲区 · " +
+            (pt.source === "住宅小区" ? "住宅小区" : "网格点位") + "</b><br>" +
+            "坐标：" + pt.lng.toFixed(6) + "," + pt.lat.toFixed(6) + "<br>" +
+            "1 公里内：<span style='color:#b91c1c'>三类设施均缺失</span><br>" +
+            "最近设施：" + rows + "</div>",
+            { width: 260, title: "服务盲区" }
+          );
+          map.openInfoWindow(win, new BMapGL.Point(pt.lng, pt.lat));
+        };
+      })(b));
+      map.addOverlay(m);
+      overlays.push(m);
+    });
+
     if (allPoints.length) map.setViewport(allPoints, { padding: 60 });
     renderReport(result);
   }
@@ -577,7 +676,26 @@
         "", "路网面积 / 直线圆面积") +
       kpiCard("过街等待估算", (crossWaitMin > 0 ? "约 " + (crossWaitMin / 60).toFixed(1) + " 分钟" : "无"),
         "", "主圈 36 条射线过街/天桥估算之和");
+    var hs = r.heat_stats || {};
+    if (hs.avg_minutes != null) {
+      kpiHtml += kpiCard("圈内平均步行耗时", hs.avg_minutes + " 分钟",
+        "", "热力网格采样（约 " + (hs.step_m || 100) + " m 步长）");
+    }
+    if (hs.gt10_ratio != null) {
+      kpiHtml += kpiCard("&gt;10 分钟区域占比", (Math.round(hs.gt10_ratio * 10000) / 100) + "%",
+        "", "占可步行采样点比例");
+    }
     $("kpis").innerHTML = kpiHtml;
+
+    // 热力说明（报告标注：热力为网格采样）
+    var hn = $("heat-note");
+    if (r.heat && r.heat.length) {
+      hn.classList.remove("hidden");
+      hn.textContent = "热力为网格采样（约 " + (hs.step_m || 100) + " m 步长）" +
+        (meta.heat_exact === false ? "，已按射线插值估算（节省 API 配额）。" : "，已按步行 API 精确计算（含过街模型）。");
+    } else {
+      hn.classList.add("hidden");
+    }
 
     // 分类达标表
     var tbody = $("category-table").querySelector("tbody");
@@ -628,6 +746,42 @@
       gb.classList.add("hidden");
     }
 
+    // v3 1km 服务盲区核验
+    var bb = $("blind-block");
+    var bs = r.blind_spots;
+    var bl = $("blind-list");
+    if (bs && bs.count > 0) {
+      bb.classList.remove("hidden");
+      bl.innerHTML = "";
+      var sum = document.createElement("div");
+      sum.className = "blind-summary";
+      sum.textContent = "共 " + bs.count + " 个服务盲区点位（含 " + bs.affected_housing_count +
+        " 个住宅小区源点），其 1km 直线范围内菜市场/药店/小学三类设施均缺失。";
+      bl.appendChild(sum);
+      bs.points.slice(0, 8).forEach(function (p) {
+        var div = document.createElement("div");
+        div.className = "blind-card";
+        var near = p.nearest || {};
+        var facs = (config.blind_spot_categories || ["菜市场", "药店", "小学"]).map(function (c) {
+          var d = near[c];
+          var txt = d != null ? (d >= 1000 ? (d / 1000).toFixed(2) + " km" : Math.round(d) + " m") : "无";
+          return "<span class='" + (d != null ? "fac-ok" : "fac-miss") + "'>" + c + " " + txt + "</span>";
+        }).join("");
+        div.innerHTML =
+          "<div class='blind-kind'>" + (p.source === "住宅小区" ? "住宅小区 · " : "网格点位 · ") + p.lng.toFixed(5) + "," + p.lat.toFixed(5) + "</div>" +
+          "<div class='fac-ruler'>1km 内最近：" + facs + "</div>";
+        bl.appendChild(div);
+      });
+      if (bs.points.length > 8) {
+        var mor = document.createElement("div");
+        mor.className = "hint";
+        mor.textContent = "…其余 " + (bs.points.length - 8) + " 个盲区点位请在地图上查看红点。";
+        bl.appendChild(mor);
+      }
+    } else {
+      bb.classList.add("hidden");
+    }
+
     // 结论建议
     $("verdict").textContent = r.verdict || "";
     var ul = $("suggestions");
@@ -652,6 +806,11 @@
     }
     if (meta.v2) {
       notes.push("步行速度 " + meta.walk_speed + " m/s（直线参照圆口径）；阻抗系数 = 路网等时圈面积/直线圆面积，越小越表示路网绕行严重。");
+    }
+    if (meta.v3) {
+      notes.push("热力为网格采样（约 " + (r.heat_stats && r.heat_stats.step_m || 100) + " m 步长）" +
+        (meta.heat_exact === false ? "，按射线插值估算（节省 API 配额）。" : "，按步行 API 精确计算（含过街模型）。") +
+        " 盲区核验为 1km 直线口径（菜市场/药店/小学），与灰色区域（500m 网格覆盖分析）口径不同、两者并存。");
     }
     if (notes.length) {
       mn.classList.remove("hidden");

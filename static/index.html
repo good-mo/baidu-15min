@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>15分钟便民生活圈体检报告 v2</title>
+  <title>15分钟便民生活圈体检报告 v3</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -18,7 +18,7 @@
   <header class="toolbar">
     <div class="brand">
       <span class="logo">15min</span>
-      <span class="brand-text">15分钟便民生活圈<br><small>体检报告 v2</small></span>
+      <span class="brand-text">15分钟便民生活圈<br><small>体检报告 v3</small></span>
     </div>
     <div class="controls">
       <label>样例街道
@@ -28,6 +28,13 @@
       </label>
       <label>中心地址 / 经纬度(lng,lat)
         <input id="addr-input" type="text" placeholder="如：深圳市南山区粤海街道科技园 或 113.9458,22.5398" size="30">
+      </label>
+      <label>坐标系（输入值）
+        <select id="coord-sys-select">
+          <option value="bd09ll" selected>BD-09（百度，默认）</option>
+          <option value="gcj02">GCJ-02（高德/腾讯）</option>
+          <option value="wgs84">WGS-84（国际）</option>
+        </select>
       </label>
       <label>时间档
         <select id="minutes-select">
@@ -81,7 +88,9 @@
         <div class="legend-items"></div>
         <div class="legend-note">
           半透明蓝色为步行等时圈（多圈时颜色越深分钟越大）；
-          灰色块为设施匮乏的灰色区域；深灰多边形为模拟障碍区。
+          灰色块为设施匮乏的灰色区域；深灰多边形为模拟障碍区；
+          小色点为热力采样（绿≤5 分钟 / 黄≤10 / 橙&gt;10 / 深灰不可达）；
+          红色感叹号为 1km 服务盲区点位。
         </div>
       </div>
       <div id="draw-hint" class="draw-hint hidden">绘制中：单击添加顶点，双击闭合</div>
@@ -90,11 +99,13 @@
 
     <section id="panel" class="panel hidden">
       <div class="panel-head">
-        <h2>体检报告 v2</h2>
+        <h2>体检报告 v3</h2>
         <button id="print-btn" class="print-btn">打印 / 导出报告</button>
       </div>
 
       <div id="kpis" class="kpis"></div>
+
+      <div id="heat-note" class="heat-note hidden"></div>
 
       <div class="block">
         <h3>分类达标情况</h3>
@@ -114,6 +125,11 @@
       <div id="gray-block" class="block hidden">
         <h3>问题清单（灰色区域自动诊疗）</h3>
         <div id="gray-list"></div>
+      </div>
+
+      <div id="blind-block" class="block hidden">
+        <h3>1公里服务盲区核验</h3>
+        <div id="blind-list"></div>
       </div>
 
       <div class="block">

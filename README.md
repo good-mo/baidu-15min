@@ -1,8 +1,27 @@
-# 15分钟便民生活圈体检报告 v2
+# 15分钟便民生活圈体检报告 v3
 
-基于百度地图开放能力（地理编码 / 逆地理编码 / POI 检索 / 步行路线规划）的 Web 应用：
+基于百度地图开放能力（地理编码 / 逆地理编码 / POI 检索 / 步行路线规划 / 坐标转换）的 Web 应用：
 输入任意中心点（一个社区/街道），系统基于真实路网计算 **15 分钟步行等时圈**（支持 5/10/15 分钟多圈），
-统计圈内 8 类民生设施覆盖情况，输出可视化「体检报告」，并自动标注设施匮乏的「灰色区域」并给出**自动诊疗建议**。
+统计圈内 8 类民生设施覆盖情况，输出可视化「体检报告」，并自动标注设施匮乏的「灰色区域」并给出**自动诊疗建议**，
+同时提供**等时圈热力图**与 **1km 服务盲区核验**。
+
+## v3 新增特性
+
+1. **坐标转换（百度 geoconv）+ 前端坐标系下拉**：工具栏新增「坐标系」选择（BD-09 默认 / GCJ-02 / WGS-84），
+   输入坐标或地址按所选坐标系解析，非 BD-09 时自动调用 `/api/coords/convert` 统一转为 BD-09 后再计算，
+   并在顶部提示条显示转换结果。百度 geoconv `from` 映射：`wgs84=1`、`gcj02=3`、`bd09ll=5`，`to=5`。
+   **注意：`coords` 参数顺序为「经度,纬度」（lng,lat），与个人习惯的「纬度,经度」相反**。
+   样例街道固定为 BD-09 坐标，不参与转换。
+2. **等时圈热力图（网格采样）**：对主圈范围按 100 米步长网格采样（点数上限 120，超限自动放大步长），
+   每个采样点计算步行耗时并输出 `heat: [{lng,lat,minutes}]`（不可达 `minutes=null`）。
+   前端以色点渲染（绿 ≤5 / 黄 ≤10 / 橙 >10 / 深灰 不可达），图例与 KPI 新增「圈内平均步行耗时」与「>10 分钟区域占比」。
+   `heat_exact=true`（默认）为每个采样点精确调用一次步行 API（含过街模型）；
+   `heat_exact=false` 走射线插值估算（不增加 API 调用，节省配额）。报告诚实标注「热力为网格采样（约 100m 步长）」。
+3. **1km 服务盲区核验（评分口径）**：对两类候选点（住宅小区 POI + 等时圈内 150 米网格点）检查
+   1 公里（直线）内是否同时缺少菜市场 / 药店 / 小学三类设施，三类均缺则判为盲区点位；
+   设施直接取自已收集 POI（不额外调用接口），输出 `blind_spots = {count, affected_housing_count, points[]}`，
+   前端地图渲染红色感叹号（住宅源点大、网格源点小），报告新增「1公里服务盲区核验」区块。
+   **与 v2 灰色区域（500m 网格覆盖分析）口径不同、两者并存互不影响**；盲区结论自动进入「结论建议」。
 
 ## v2 新增特性
 
@@ -58,6 +77,9 @@ python app.py --port 5000
 
 - **步行路线 API（directionlite）配额有限**：默认 36 射线 × 8 次二分 ≈ **288 次算路请求/单圈**；
   多圈（5/10/15）为单圈的三倍；射线数 24/48 可降低/提高精度。
+- **v3 热力图配额提醒**：`heat_exact=true` 每个热力采样点额外调用一次步行 API
+  （≤120 点，可与 288 次算路请求叠加，建议测试时使用 `heat_exact=false` 或控制网格密度）；
+  `heat_exact=false` 射线插值模式不增加额外 API 调用。
 - POI 检索：8 类 + 住宅 1 类共 9 类 × 最多 3 页（每页 20 条）。
 - 后端对每次百度 API 调用前 `sleep ~0.15s` 做限流（单线程顺序调用），多圈任务约需 2-5 分钟，请耐心等待（前端有进度条）。
 - 计算结果做内存缓存（相同中心/时长档/射线/阻抗参数/障碍直接复用），步行算路结果也有内存缓存。
@@ -75,17 +97,24 @@ python app.py --port 5000
   （药店/医院、超市/便利店、学校、公交/地铁站）最近直线距离，存在 ≥2 类 >500 米即标记灰色点；
   灰色点做 4-邻域 BFS 连通聚类，过滤 <3 点的碎片簇；每簇按缺失类别数定严重度，
   按质心 500 米内住宅 POI 数定影响规模，按规则表定优先级。
+- **v3 等时圈热力图**：主圈 bbox 内按 100 米网格取「多边形内」采样点（点数上限 120，
+  超限自动按 2/3/4/5 倍放大步长重取）；`exact` 模式逐点调用步行 API 取 `effective_duration`
+  换算分钟（不可达记为 null），`false` 模式按「点相对中心的角度」在相邻射线边界半径间线性插值估算。
+- **v3 1km 服务盲区**：候选点 = 住宅 POI + 圈内 150 米网格点（上限 1500 个）；对每个候选点统计
+  1km 直线内菜市场/药店/小学的最近距离（设施从已收集 POI 按「类别+名称包含关键词」提取），
+  三类全部缺失才判盲区；输出受影响住宅源点数量用于建议文案。
 
 ## API 一览
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/health` | 健康检查 `{status, ak_configured}` |
-| GET | `/api/config` | 下发 ak、默认中心点、样例街道、分类、`v2_defaults`、`required_facility_labels` |
+| GET | `/api/config` | 下发 ak、默认中心点、样例街道、分类、`v2_defaults`、`required_facility_labels`、`blind_spot_radius`、`blind_spot_categories` |
 | GET | `/api/geocode?address=&city=` | 地址转坐标 |
 | GET | `/api/reverse?lng=&lat=` | 坐标转地址 |
-| POST | `/api/isochrone` | `{lng, lat, minutes(数字或数组), rays=36, steps=8, walk_speed, crossing_sec, overpass_sec, obstacles}`，异步返回 `{job_id}` |
-| GET | `/api/isochrone/<job_id>` | 轮询进度 / 完成结果（结果含 `rings[]`、`gray.regions[]`、`meta`） |
+| GET | `/api/coords/convert?coords=lng,lat[;lng,lat...]&from=wgs84\|gcj02\|bd09ll` | v3 坐标转换：whitelist≤50 点，顺序为**经度,纬度**；由百度 geoconv 统一转为 BD-09；`from` 映射 wgs84=1/gcj02=3/bd09ll=5；`bd09ll` 直接回显不调 API；无 AK 返回 502 error |
+| POST | `/api/isochrone` | `{lng, lat, minutes(数字或数组), rays=36, steps=8, walk_speed, crossing_sec, overpass_sec, obstacles, heat_exact=true}`，异步返回 `{job_id}`；`heat_exact` 进入任务缓存 key |
+| GET | `/api/isochrone/<job_id>` | 轮询进度 / 完成结果（结果含 `rings[]`、`heat[]`、`heat_stats`、`blind_spots`、`gray.regions[]`、`meta`） |
 | GET | `/api/report/<job_id>` | 完整报告别名接口 |
 | GET | `/` | 前端页面 |
 
@@ -93,11 +122,18 @@ python app.py --port 5000
 `minutes / boundary / area_km2 / perimeter_km / straight_radius_km / straight_area_km2 / impedance_coef / crossing / degenerate`；
 旧字段 `result.area_km2 / perimeter_km / isochrone` 保留（= 主圈，即分钟数最大的一圈）；
 `result.gray.regions[]`（兼容 alias `gray_areas`）每条含 `affected_res_count / affected_level / severity / suggestions / priority`；
-`result.meta` 含 `walk_speed / crossing_sec / overpass_sec / obstacles / crossing_mode(heuristic|unavailable)`。
+`result.meta` 含 `walk_speed / crossing_sec / overpass_sec / obstacles / crossing_mode(heuristic|unavailable) / heat_exact`。
+
+返回结构关键点（v3）：`result.heat = [{lng, lat, minutes|null}]`（主圈热力采样），
+`result.heat_stats = {points, sampled, step_m, avg_minutes, gt10_ratio}`（平均步行耗时与 >10 分钟占比 KPI），
+`result.blind_spots = {count, affected_housing_count, points: [{lng, lat, source(住宅小区|网格点), nearest: {菜市场: 米|None, 药店: 米|None, 小学: 米|None}}]}`。
 
 ## 坐标系与安全建议
 
-- 本项目全部使用**百度坐标系 bd09ll**（百度地图默认），请勿与 GCJ-02/WGS-84 混用。
+- 本项目地图与计算统一使用**百度坐标系 bd09ll**（百度地图默认）；v3 起输入坐标支持
+  WGS-84 / GCJ-02 / BD-09，前端下拉选择后由后端 geoconv 统一转 BD-09，样例街道固定为 BD-09。
+- **`coords` 顺序的坑**：坐标转换接口参数为「经度,纬度」（lng,lat），地址输入框的占位符也是 `lng,lat`；
+  若误按「纬度,经度」传入，转换结果会错位，请勿混用。
 - **AK 安全建议**：
   - 服务端调用建议在百度控制台配置 **IP 白名单**（仅允许部署服务器 IP 调用）。
   - 浏览器端 JS（地图）建议配置 **referer 白名单**（仅允许你的站点域名加载）。
