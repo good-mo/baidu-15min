@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>15分钟便民生活圈体检报告</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+  <!-- AK 未配置横幅 -->
+  <div id="ak-banner" class="ak-banner hidden">请在环境变量 BAIDU_MAP_AK 配置百度地图密钥</div>
+
+  <!-- 错误/提示条 -->
+  <div id="notice-bar" class="notice-bar hidden"></div>
+
+  <!-- 顶部工具条 -->
+  <header class="toolbar">
+    <div class="brand">
+      <span class="logo">15min</span>
+      <span class="brand-text">15分钟便民生活圈<br><small>体检报告</small></span>
+    </div>
+    <div class="controls">
+      <label>样例街道
+        <select id="sample-select">
+          <option value="">— 自定义 —</option>
+        </select>
+      </label>
+      <label>中心地址 / 经纬度(lng,lat)
+        <input id="addr-input" type="text" placeholder="如：深圳市南山区粤海街道科技园 或 113.9458,22.5398" size="34">
+      </label>
+      <label>射线数
+        <select id="rays-select">
+          <option value="24">24</option>
+          <option value="36" selected>36</option>
+          <option value="48">48</option>
+        </select>
+      </label>
+      <button id="calc-btn">计算 15 分钟等时圈</button>
+    </div>
+  </header>
+
+  <!-- 进度条 -->
+  <div id="progress-wrap" class="progress-wrap hidden">
+    <div class="progress-track"><div id="progress-fill" class="progress-fill"></div></div>
+    <span id="progress-text">正在算路 0/36</span>
+  </div>
+
+  <!-- 主区域：地图 + 报告 -->
+  <main class="main">
+    <section class="map-wrap">
+      <div id="map" class="map-canvas"></div>
+      <div id="legend" class="legend hidden">
+        <div class="legend-title">设施分类</div>
+        <div class="legend-items"></div>
+        <div class="legend-note">半透明蓝色为 15 分钟步行等时圈，灰色块为设施匮乏的灰色区域</div>
+      </div>
+      <div id="map-placeholder" class="map-placeholder hidden">地图加载中…</div>
+    </section>
+
+    <section id="panel" class="panel hidden">
+      <div class="panel-head">
+        <h2>体检报告</h2>
+        <button id="print-btn" class="print-btn">打印 / 导出报告</button>
+      </div>
+
+      <div id="kpis" class="kpis"></div>
+
+      <div class="block">
+        <h3>分类达标情况</h3>
+        <table id="category-table" class="cat-table">
+          <thead>
+            <tr><th>类别</th><th>数量</th><th>最近距离</th><th>真实步行</th><th>达标</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <div class="block">
+        <h3>设施数量分布</h3>
+        <canvas id="bar-chart" width="520" height="240"></canvas>
+      </div>
+
+      <div id="gray-block" class="block hidden">
+        <h3>灰色区域</h3>
+        <div id="gray-list"></div>
+      </div>
+
+      <div class="block">
+        <h3>结论建议</h3>
+        <div id="verdict" class="verdict"></div>
+        <ul id="suggestions"></ul>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
